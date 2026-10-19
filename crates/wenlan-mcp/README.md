@@ -13,7 +13,7 @@ wenlan connect codex              # or: claude-code, cursor, claude-desktop, vsc
 wenlan connect cursor --dry-run   # preview before editing JSON config
 ```
 
-MCP-only setup gives agents the whole tool surface: capture and recall, reading and writing wiki pages, the Space-owned Brief with `update_brief` for handoff, and page distillation. It does not install the Claude Code slash skills (`/brief`, `/handoff`, `/distill`, `/setup`), which wrap those same tools in a guided flow; install the Wenlan plugin if you want them.
+MCP-only setup gives agents the whole tool surface: capture and recall, reading and writing wiki pages, the Space-owned Brief with `update_brief` for handoff, and page distillation. It does not install the Claude Code slash skills (`/wenlan`, `/brief`, `/handoff`), which wrap those same tools in a guided flow; install the Wenlan plugin if you want them.
 
 If you only need the raw MCP connector config, add this to your MCP client:
 
@@ -84,7 +84,7 @@ The refinement trio remains because this review queue has no CLI or replacement
 path. Remote HTTP clients can list it, but `accept_refinement` and
 `reject_refinement` are hidden and hard-rejected remotely.
 
-Lint repair is three tools behind `/lint repair`: `lint_repair_prepare` opens
+Lint repair is three tools behind `/wenlan lint repair`: `lint_repair_prepare` opens
 and pages a plan or turns one Review Item into a manifest, `lint_repair_apply`
 applies one approved manifest, and `lint_repair_verify` records the follow-up
 check. All three are local stdio only. The agent-assisted Deep work packet is

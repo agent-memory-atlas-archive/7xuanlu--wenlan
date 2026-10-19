@@ -4,7 +4,7 @@ Claude Code workflow skills installed by the Wenlan plugin.
 
 The skills do not store data themselves. They guide Claude Code to use the local `wenlan-mcp` tools, which talk to the Wenlan daemon on `127.0.0.1:7878`.
 
-These files are also the source for the Codex plugin: `scripts/gen-codex-plugin.mjs` turns each `SKILL.md` here into `plugin-codex/skills/<skill>/SKILL.md`, applying `plugin-codex/overlay.json` for the parts Codex does differently. Edit here, then regenerate.
+These files are also the source for the Codex plugin: `scripts/gen-codex-plugin.mjs` turns each menu skill here into `plugin-codex/skills/<skill>/SKILL.md` and each workflow reached through `/wenlan` into `plugin-codex/skills/wenlan/references/<skill>.md`, applying `plugin-codex/overlay.json` for the parts Codex does differently. Edit here, then regenerate.
 
 ## Commands
 
@@ -13,17 +13,17 @@ These files are also the source for the Codex plugin: `scripts/gen-codex-plugin.
 
 | Command | Purpose |
 | --- | --- |
-| `/setup` | set up or repair Wenlan (installs the local runtime) |
+| `/wenlan [what you want]` | the front door: say what you want, or type it bare for status and setup |
 | `/brief [topic]` | load the Brief for the current Space (optional; not a boot step) |
-| `/capture <x>` | save one durable memory in flow |
+| `/capture <x>` | save one durable memory in flow, or this conversation as one note on request |
 | `/recall <q>` | search local memory |
-| `/lint [deep\|repair] [scope]` | diagnose, or resolve all findings safely |
-| `/distill [t]` | synthesize or refresh source-backed pages for the active Space |
-| `/pages [q]` | browse and open distilled pages |
-| `/curate <surface>` | deep audit of captures, revisions or refinements |
-| `/forget <id>` | delete one memory by ID, after confirmation |
 | `/handoff` | end-of-session debrief: captures, session log, Brief update |
-| `/help` | one-screen quick reference |
+| `/wenlan setup` | set up or repair Wenlan (installs the local runtime) |
+| `/wenlan lint [deep\|repair] [scope]` | diagnose, or resolve all findings safely |
+| `/wenlan distill [t]` | synthesize or refresh source-backed pages for the active Space |
+| `/wenlan pages [q]` | browse and open distilled pages |
+| `/wenlan curate <surface>` | deep audit of captures, revisions or refinements |
+| `/wenlan forget <id>` | delete one memory by ID, after confirmation |
 <!-- verbs:end -->
 
 Plugin metadata lives in [`.claude-plugin/plugin.json`](../.claude-plugin/plugin.json); the listing README is [`../README.md`](../README.md).
