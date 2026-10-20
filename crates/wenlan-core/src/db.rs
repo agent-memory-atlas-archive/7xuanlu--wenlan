@@ -91,6 +91,7 @@ mod space_rename;
 mod truth_exposure;
 
 pub use agent_presence::{presence_agent_id, AgentPresence};
+pub(crate) use code_basis::{row_from as code_basis_row_from, ROW_SELECT as CODE_BASIS_ROW_SELECT};
 pub use code_basis::{CodeBasisRow, CodeBasisVerdict};
 pub(crate) use community_grouping_state::CommunityGroupingLeaseCleanup;
 pub(crate) use eval_temporal_seed::EvalTemporalSeed;
@@ -126,7 +127,7 @@ mod claim_edge_lifecycle_test;
 #[cfg(test)]
 mod claim_identity_test;
 #[cfg(test)]
-mod code_basis_test;
+pub(crate) mod code_basis_test;
 #[cfg(test)]
 mod edges_rebuild_test;
 #[cfg(test)]
