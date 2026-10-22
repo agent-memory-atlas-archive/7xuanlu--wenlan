@@ -101,6 +101,9 @@ const en = {
   codeBasis: {
     changedLine: "The code this page relies on changed: {{file}} lines {{from}}\u2013{{to}}",
     changedLineOne: "The code this page relies on changed: {{file}} line {{from}}",
+    aiLooked: "AI looked: {{sentence}}",
+    aiStaleSuffix: ", next steep fixes it",
+    aiWillLook: "Changed, the next steep looks at it",
     missingFile: "Code not found: {{file}} (the file is gone)",
     missingRepo: "Code not found: {{file}} (the repository is gone)",
     unreadable: "Cannot read code: {{file}}",
@@ -133,8 +136,8 @@ const en = {
     codeCount_other: "{{count}} code references",
     review: {
       group: "Code changed",
-      summary_one: "The code {{count}} page relies on changed",
-      summary_other: "The code {{count}} pages rely on changed",
+      summary_one: "Code behind {{count}} page changed",
+      summary_other: "Code behind {{count}} pages changed",
       action: "Review",
       open: "Review code changes",
       openNote: "Open page",
@@ -2867,6 +2870,9 @@ const zhHans = {
   codeBasis: {
     changedLine: "这篇靠的代码变了：{{file}} 第 {{from}}\u2013{{to}} 行",
     changedLineOne: "这篇靠的代码变了：{{file}} 第 {{from}} 行",
+    aiLooked: "AI 看过：{{sentence}}",
+    aiStaleSuffix: "，下次沉淀会改好",
+    aiWillLook: "有变动，下次沉淀时 AI 会看",
     missingFile: "找不到代码：{{file}}（文件已不在）",
     missingRepo: "找不到代码：{{file}}（仓库已不在）",
     unreadable: "读不到代码：{{file}}",
@@ -5571,6 +5577,9 @@ const zhHant = {
   codeBasis: {
     changedLine: "這篇靠的代碼變了：{{file}} 第 {{from}}\u2013{{to}} 行",
     changedLineOne: "這篇靠的代碼變了：{{file}} 第 {{from}} 行",
+    aiLooked: "AI 看過：{{sentence}}",
+    aiStaleSuffix: "，下次沉澱會改好",
+    aiWillLook: "有變動，下次沉澱時 AI 會看",
     missingFile: "找不到代碼：{{file}}（檔案已不在）",
     missingRepo: "找不到代碼：{{file}}（倉庫已不在）",
     unreadable: "讀不到代碼：{{file}}",

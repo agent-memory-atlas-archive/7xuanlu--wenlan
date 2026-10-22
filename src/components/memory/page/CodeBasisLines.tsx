@@ -3,9 +3,9 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { CodeBasisRef } from "../../../lib/tauri";
 import { CodeBasisDialog } from "./CodeBasisDialog";
-import { codeBasisLineText } from "./codeBasisShared";
+import { codeBasisAiLineText, codeBasisLineText } from "./codeBasisShared";
 import { OverflowMenu } from "./OverflowMenu";
-import { codeBasisKeyOf, codeBasisNeedingAttention, type useCodeBasisActions } from "./useCodeBasisActions";
+import { codeBasisKeyOf, type useCodeBasisActions } from "./useCodeBasisActions";
 
 export interface NoteCodeBasisHandlers {
   actions: ReturnType<typeof useCodeBasisActions>;
@@ -15,6 +15,7 @@ export interface NoteCodeBasisHandlers {
 
 interface CodeBasisLinesProps extends NoteCodeBasisHandlers {
   pageId: string;
+  /** The rows that need a person, as `codeBasisNeedingAttention` picks them. */
   codeBasis: readonly CodeBasisRef[];
   disabled?: boolean;
 }
@@ -29,7 +30,7 @@ export function CodeBasisLines({
 }: CodeBasisLinesProps) {
   const { t } = useTranslation();
   const [viewing, setViewing] = useState<CodeBasisRef | null>(null);
-  const lines = codeBasisNeedingAttention(codeBasis);
+  const lines = codeBasis;
   if (lines.length === 0) return null;
 
   return <>
@@ -38,8 +39,12 @@ export function CodeBasisLines({
         const busy = actions.isBusy(pageId, row);
         const failure = actions.failureOf(pageId, row);
         const stop = () => { void actions.stop(pageId, row); };
+        const aiLine = codeBasisAiLineText(t, row);
         return <li key={codeBasisKeyOf(pageId, row)} className="note-review-notice__basis">
-          <p className="note-review-notice__message note-review-notice__basis-text">{codeBasisLineText(t, row)}</p>
+          <div className="note-review-notice__basis-body">
+            <p className="note-review-notice__message note-review-notice__basis-text">{codeBasisLineText(t, row)}</p>
+            {aiLine && <p className="note-review-notice__message note-review-notice__basis-ai">{aiLine}</p>}
+          </div>
           <div className="note-review-notice__actions">
             {row.state === "pending" ? <>
               <button
