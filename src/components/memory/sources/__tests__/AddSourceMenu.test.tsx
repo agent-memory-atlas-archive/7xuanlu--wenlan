@@ -111,7 +111,7 @@ describe("AddSourceMenu", () => {
     mocks.openDialog.mockResolvedValue("/Users/me/research");
     render(wrap(<AddSourceMenu onClose={() => {}} />));
     fireEvent.click(await screen.findByText("Connect Obsidian vault"));
-    // Shown in the dialog: the main window has no toaster.
+    // Shown in the dialog, next to the choice that failed.
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("Could not add the source");
     expect(alert).toHaveTextContent("Choose the root folder of an Obsidian vault.");
@@ -167,7 +167,7 @@ describe("AddSourceMenu", () => {
     mocks.openDialog.mockResolvedValue("/Users/me/research");
     render(wrap(<AddSourceMenu onClose={() => {}} />));
     fireEvent.click(await screen.findByText("Connect Logseq graph"));
-    // Shown in the dialog: the main window has no toaster.
+    // Shown in the dialog, next to the choice that failed.
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("Could not add the source");
     expect(alert).toHaveTextContent("Choose the root folder of a Logseq graph.");
@@ -181,7 +181,10 @@ describe("AddSourceMenu", () => {
     render(wrap(<AddSourceMenu onClose={() => {}} />));
     fireEvent.click(await screen.findByText("Connect a folder"));
     fireEvent.click(await screen.findByText("Import once"));
-    await waitFor(() => expect(toast).toHaveBeenCalledWith("Source connected, but the first update failed. Try Refresh in Info.", { description: "Error: offline" }));
+    await waitFor(() => expect(toast).toHaveBeenLastCalledWith("Source connected", {
+      id: expect.stringMatching(/^source-connected-/),
+      description: "First update failed. Try Refresh in Info.",
+    }));
     expect(mocks.addSource).toHaveBeenCalledTimes(1);
   });
 

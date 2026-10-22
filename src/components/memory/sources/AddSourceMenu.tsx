@@ -30,8 +30,8 @@ export default function AddSourceMenu({ onClose }: { onClose: () => void }) {
   const [showChats, setShowChats] = useState(false);
   // A picked folder waits here while the user chooses sync or import-once.
   const [picked, setPicked] = useState<PickedFolder | null>(null);
-  // The main window mounts no toaster (toasts render in the separate overlay
-  // window), so a failure to add a source is shown here in the dialog.
+  // A failure to add a source is shown here in the dialog, next to the choice
+  // that failed, rather than as a toast that disappears.
   const [failure, setFailure] = useState<string | null>(null);
   const fail = (error: unknown) => setFailure(error instanceof Error ? error.message : String(error));
   const { data: version } = useQuery({ queryKey: ["daemonVersion"], queryFn: getDaemonVersion });
@@ -90,11 +90,14 @@ export default function AddSourceMenu({ onClose }: { onClose: () => void }) {
       addSource(folder.sourceType, folder.path, followChanges),
     onSuccess: (source) => {
       refreshSources();
-      toast(t("sourceAccess.connected"), { description: source.path });
+      // A failed first read updates this same toast instead of stacking a second.
+      const toastId = `source-connected-${source.id}`;
+      toast(t("sourceAccess.connected"), { id: toastId, description: source.path });
       // Both choices read the source once now; only a synced source is
       // checked again in the background.
       void syncRegisteredSource(source.id).then(refreshSources).catch((error) => {
-        toast(t("sourceAccess.connectedUpdateFailed"), { description: String(error) });
+        console.warn("[sources] first update failed", error);
+        toast(t("sourceAccess.connected"), { id: toastId, description: t("sourceAccess.connectedUpdateFailed") });
         refreshSources();
       });
       onClose();

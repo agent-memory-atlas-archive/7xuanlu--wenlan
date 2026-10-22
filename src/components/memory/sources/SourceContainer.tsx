@@ -78,7 +78,10 @@ function SourceContainerInfo({ source, refreshing, onRefresh, heading }: { sourc
   const followMutation = useMutation({
     mutationFn: (followChanges: boolean) => setSourceFollowChanges(source.id, followChanges),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["registeredSources"] }),
-    onError: (error) => toast(t("sourceContainer.followFailed"), { description: String(error) }),
+    onError: (error) => {
+      console.warn("[sources] follow toggle failed", error);
+      toast(t("sourceContainer.followFailed"));
+    },
   });
   return <>
     <section>
@@ -130,7 +133,10 @@ export default function SourceContainer({ location, search, filter, lens, onSear
         queryClient.invalidateQueries({ queryKey: ["sourceDir"] }),
       ]);
     },
-    onError: (error) => toast(t("sourceContainer.refreshFailed"), { description: String(error) }),
+    onError: (error) => {
+      console.warn("[sources] refresh failed", error);
+      toast(t("sourceContainer.refreshFailed"));
+    },
   });
 
   const indexedByPath = useMemo(() => {
@@ -176,7 +182,10 @@ export default function SourceContainer({ location, search, filter, lens, onSear
         } else if (indexed) {
           onOpenDocument(indexed);
         } else {
-          void openFile(path).catch((error) => toast(t("sourceAccess.openFileFailed"), { description: String(error) }));
+          void openFile(path).catch((error) => {
+            console.warn("[sources] open file failed", error);
+            toast(t("sourceAccess.openFileFailed"));
+          });
         }
       },
     };

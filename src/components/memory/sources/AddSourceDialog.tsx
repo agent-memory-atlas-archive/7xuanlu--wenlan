@@ -33,7 +33,11 @@ export default function AddSourceDialog({ onClose, onSuccess }: Props) {
       if (sourceType === "obsidian" || sourceType === "logseq" || !follow) {
         syncRegisteredSource(newSource.id).then(() => {
           queryClient.invalidateQueries({ queryKey: ["registeredSources"] });
-        }).catch(() => toast(t("sourceAccess.addFailed")));
+        }).catch((error) => {
+          // The source was added; only its first read failed.
+          console.warn("[sources] first update failed", error);
+          toast(t("sourceAccess.connected"), { description: t("sourceAccess.connectedUpdateFailed") });
+        });
       }
       onSuccess();
     },
