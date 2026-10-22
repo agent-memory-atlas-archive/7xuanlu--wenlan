@@ -1778,6 +1778,7 @@ mod tests {
                 page_match_threshold: 0.0,
                 citations_json: None,
                 basis_marks: Vec::new(),
+                basis_space_guard: None,
             },
         )
         .await

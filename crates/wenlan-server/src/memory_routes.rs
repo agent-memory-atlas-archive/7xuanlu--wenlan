@@ -219,19 +219,33 @@ enum CaptureEntity {
 /// Decide which entity a captured name refers to. Exact name or alias only:
 /// one live match links, several live matches refuse the store so the caller
 /// can pass the `entity_id` it means, and an archived entity owning the name
-/// as an alias is reused rather than duplicated.
+/// as an alias is reused rather than duplicated. A Space-locked caller only
+/// sees entities in its own Space: one elsewhere is neither linked nor listed.
 async fn plan_capture_entity(
     db: &wenlan_core::db::MemoryDB,
     name: &str,
     entity_type: Option<&str>,
+    scope: &wenlan_core::read_scope::ReadScope,
 ) -> Result<CaptureEntity, ServerError> {
-    let candidates = match db.entity_name_candidates(name).await {
+    let mut candidates = match db.entity_name_candidates(name).await {
         Ok(candidates) => candidates,
         Err(e) => {
             tracing::warn!("[memory] entity lookup for '{name}' failed: {e}");
             return Ok(CaptureEntity::Unknown(name.to_string()));
         }
     };
+    if *scope != wenlan_core::read_scope::ReadScope::Global {
+        let mut visible = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if db
+                .entity_visible_in_scope(&candidate.entity_id, scope)
+                .await?
+            {
+                visible.push(candidate);
+            }
+        }
+        candidates = visible;
+    }
     let active: Vec<_> = candidates.iter().filter(|c| c.active).collect();
     match active.as_slice() {
         [only] => return Ok(CaptureEntity::Existing(only.entity_id.clone())),
@@ -272,6 +286,7 @@ async fn link_capture_entity(
     source_id: &str,
     plan: CaptureEntity,
     space: Option<&str>,
+    scope: &wenlan_core::read_scope::ReadScope,
     agent: &str,
     warnings: &mut Vec<String>,
 ) -> Option<String> {
@@ -298,6 +313,21 @@ async fn link_capture_entity(
                 confidence: None,
             };
             match wenlan_core::post_write::create_entity(db, request, agent).await {
+                // Creating resolves the name across every Space, so it can
+                // return an entity the Space-locked caller may not link.
+                Ok(result)
+                    if *scope != wenlan_core::read_scope::ReadScope::Global
+                        && !db
+                            .entity_visible_in_scope(&result.id, scope)
+                            .await
+                            .unwrap_or(false) =>
+                {
+                    warnings.push(format!(
+                        "entity \"{name}\" could not be created in this space, so this memory \
+                         is not linked to it."
+                    ));
+                    return None;
+                }
                 Ok(result) => result.id,
                 Err(e) => {
                     warnings.push(format!(
@@ -566,15 +596,39 @@ async fn handle_store_memory_inner(
     // before anything is written; a new name that comes with its type is
     // created after the store succeeds (`link_capture_entity`), so a rejected
     // memory never leaves an orphan entity behind.
+    // A Space-locked caller (the `x-wenlan-space` header) links only an
+    // entity in its own Space, the same as every other by-id write.
+    // The header is only a fallback for where the memory lands, so a name the
+    // daemon does not know must not fail the store: it still narrows the
+    // lookup, to a Space that holds no entities.
+    let entity_scope = match header_space
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+    {
+        None => wenlan_core::read_scope::ReadScope::Global,
+        Some(header) => crate::read_scope::effective_read_scope(&db, None, Some(header))
+            .await
+            .unwrap_or_else(|_| wenlan_core::read_scope::ReadScope::Space(header.to_string())),
+    };
     let entity_plan = match (
         req.entity_id.as_deref(),
         req.entity.as_deref().map(str::trim),
     ) {
-        (Some(direct_id), _) => CaptureEntity::Existing(direct_id.to_string()),
+        (Some(direct_id), _) => {
+            if entity_scope != wenlan_core::read_scope::ReadScope::Global
+                && !db.entity_visible_in_scope(direct_id, &entity_scope).await?
+            {
+                return Err(ServerError::NotFound(format!(
+                    "entity {direct_id} not found, so nothing was stored"
+                )));
+            }
+            CaptureEntity::Existing(direct_id.to_string())
+        }
         (None, Some(name)) if !name.is_empty() => {
             #[cfg(test)]
             wait_at_store_lock_test_hook(StoreLockTestStage::EntityResolution).await;
-            plan_capture_entity(&db, name, req.entity_type.as_deref()).await?
+            plan_capture_entity(&db, name, req.entity_type.as_deref(), &entity_scope).await?
         }
         _ => CaptureEntity::None,
     };
@@ -959,6 +1013,7 @@ async fn handle_store_memory_inner(
         &source_id,
         entity_plan,
         persisted_space.as_deref(),
+        &entity_scope,
         &resolved_agent,
         &mut warnings,
     )
@@ -2872,6 +2927,92 @@ mod store_scheduler_handoff_tests {
             .unwrap()
             .0;
         assert_eq!(chosen.entity_id.as_deref(), Some(dana_two.as_str()));
+    }
+
+    /// A Space-locked capture links only entities in its own Space: an entity
+    /// in another Space is neither linked by name nor reachable by id, and
+    /// the name lookup does not reveal it.
+    #[tokio::test]
+    async fn a_space_locked_capture_never_links_an_entity_in_another_space() {
+        let _lock = crate::TEST_DATA_DIR_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let _env = DataDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            wenlan_core::db::MemoryDB::new(dir.path(), Arc::new(wenlan_core::events::NoopEmitter))
+                .await
+                .unwrap(),
+        );
+        db.create_space("work", None, false).await.unwrap();
+        db.create_space("personal", None, false).await.unwrap();
+        let erin = db
+            .store_entity("Erin Park", "person", Some("personal"), None, None)
+            .await
+            .unwrap();
+        let gate = wenlan_core::quality_gate::QualityGate::new(wenlan_core::tuning::GateConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let state = Arc::new(RwLock::new(ServerState {
+            db: Some(db.clone()),
+            quality_gate: gate,
+            ..Default::default()
+        }));
+        let store = |content: &str, entity: Option<&str>, entity_id: Option<&str>| {
+            handle_store_memory(
+                State(state.clone()),
+                HeaderMap::new(),
+                crate::space_header::SpaceHeader(Some("work".to_string())),
+                Json(StoreMemoryRequest {
+                    content: content.to_string(),
+                    memory_type: Some("fact".to_string()),
+                    space: (None).into(),
+                    source_agent: Some("test-agent".to_string()),
+                    title: None,
+                    confidence: None,
+                    supersedes: None,
+                    entity: entity.map(str::to_string),
+                    entity_type: entity.map(|_| "person".to_string()),
+                    entity_id: entity_id.map(str::to_string),
+                    structured_fields: None,
+                    retrieval_cue: None,
+                }),
+            )
+        };
+
+        let content = "Erin Park reviews the quarterly vendor contracts.";
+        match store(content, None, Some(&erin)).await {
+            Err(ServerError::NotFound(_)) => {}
+            other => panic!("an entity id in another Space must refuse the store, got {other:?}"),
+        }
+        assert!(
+            !db.has_memory_content(content).await.unwrap(),
+            "a refused capture stores nothing"
+        );
+
+        // Entity creation resolves names across Spaces, so the typed name
+        // finds the other Space's entity; the capture stores the memory
+        // unlinked rather than linking it.
+        let named = store(content, Some("Erin Park"), None).await.unwrap().0;
+        assert_eq!(
+            named.entity_id, None,
+            "the other Space's entity is not linked"
+        );
+        assert!(
+            named.warnings.iter().all(|w| !w.contains(&erin)),
+            "the warning does not reveal the other Space's entity: {:?}",
+            named.warnings
+        );
+        assert_eq!(
+            db.get_entity_detail(&erin)
+                .await
+                .unwrap()
+                .entity
+                .memory_count,
+            0
+        );
     }
 
     #[tokio::test]
