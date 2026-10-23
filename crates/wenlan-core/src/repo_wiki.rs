@@ -1840,6 +1840,9 @@ pub fn find_tool(name: &str) -> Option<PathBuf> {
         if name == "claude" {
             candidates.push(home.join(".claude/local"));
         }
+        if name == "cursor-agent" || name == "agent" {
+            candidates.push(home.join(".cursor/bin"));
+        }
     }
     candidates.extend(
         ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
@@ -1878,9 +1881,12 @@ const CLAUDE_DAILY_TOOLS: &[&str] = &[
 ];
 
 /// Program arguments for one daily step (`verb` is `steep` or `wiki`) of
-/// `agent` on `space`. The run is non-interactive: Claude Code gets only the
-/// read-only tools above; Codex runs in its read-only sandbox.
+/// `agent` on `space`. The run is non-interactive and writes only through
+/// Wenlan: Claude Code gets only the read-only tools above, Codex runs in its
+/// read-only sandbox, Copilot may only read and call Wenlan, Cursor runs
+/// without `--force` (it proposes file changes but makes none).
 pub fn daily_agent_args(agent: RepoWikiAgent, space: &str, verb: &str) -> Vec<String> {
+    let prompt = format!("Use the wenlan skill to run Wenlan: /wenlan {verb} space:{space}");
     match agent {
         RepoWikiAgent::Claude => {
             let mut args = vec![
@@ -1898,15 +1904,64 @@ pub fn daily_agent_args(agent: RepoWikiAgent, space: &str, verb: &str) -> Vec<St
             "read-only".into(),
             format!("$wenlan {verb} space:{space}"),
         ],
+        RepoWikiAgent::Cursor => vec![
+            "-p".into(),
+            prompt,
+            "--approve-mcps".into(),
+            "--output-format".into(),
+            "text".into(),
+        ],
+        RepoWikiAgent::Copilot => vec![
+            "-p".into(),
+            prompt,
+            format!("--allow-tool={}", COPILOT_DAILY_TOOLS.join(", ")),
+            "--no-ask-user".into(),
+            "-s".into(),
+        ],
     }
 }
 
+/// What a daily Copilot run may do without asking: read, use Wenlan, and
+/// read git history.
+const COPILOT_DAILY_TOOLS: &[&str] = &[
+    "read",
+    "wenlan",
+    "shell(git rev-parse:*)",
+    "shell(git ls-files:*)",
+    "shell(git log:*)",
+    "shell(git show:*)",
+];
+
 /// The executable for `agent`.
 pub fn find_agent(agent: RepoWikiAgent) -> Option<PathBuf> {
-    find_tool(match agent {
-        RepoWikiAgent::Claude => "claude",
-        RepoWikiAgent::Codex => "codex",
-    })
+    agent.programs().iter().find_map(|name| find_tool(name))
+}
+
+/// Where `agent` may read Wenlan's skill under `home`, for the tools that
+/// read Agent Skills from a per-user folder the app's Set up fills. Claude
+/// Code and Codex get theirs from a plugin instead, so they have none.
+pub fn wenlan_skill_paths(agent: RepoWikiAgent, home: &Path) -> Vec<PathBuf> {
+    let folders: &[&str] = match agent {
+        RepoWikiAgent::Claude | RepoWikiAgent::Codex => &[],
+        RepoWikiAgent::Cursor => &[".cursor/skills"],
+        RepoWikiAgent::Copilot => &[".copilot/skills"],
+    };
+    folders
+        .iter()
+        .map(|folder| home.join(folder).join("wenlan/SKILL.md"))
+        .collect()
+}
+
+/// Whether a daily run of `agent` on this computer can use Wenlan: without
+/// the skill, the tool runs, finds no `/wenlan`, and changes nothing.
+pub fn has_wenlan_skill(agent: RepoWikiAgent) -> bool {
+    match dirs::home_dir() {
+        Some(home) => {
+            let paths = wenlan_skill_paths(agent, &home);
+            paths.is_empty() || paths.iter().any(|path| path.is_file())
+        }
+        None => true,
+    }
 }
 
 /// Whether a daily run of `binding` is due at local `now`: enabled, past its

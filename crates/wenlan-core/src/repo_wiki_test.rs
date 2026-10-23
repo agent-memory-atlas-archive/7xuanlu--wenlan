@@ -621,6 +621,34 @@ fn daily_agent_args_run_one_skill_non_interactively() {
             "$wenlan steep space:site"
         ]
     );
+    // The other tools write only through Wenlan: no --force, no write tool,
+    // no approval beyond Wenlan's own tools.
+    let skill = "Use the wenlan skill to run Wenlan: /wenlan wiki space:site";
+    let cursor = daily_agent_args(RepoWikiAgent::Cursor, "site", "wiki");
+    assert_eq!(&cursor[..2], ["-p", skill]);
+    assert!(!cursor.iter().any(|arg| arg == "--force" || arg == "--yolo"));
+    let copilot = daily_agent_args(RepoWikiAgent::Copilot, "site", "wiki");
+    assert_eq!(&copilot[..2], ["-p", skill]);
+    assert!(copilot.contains(&"--no-ask-user".to_owned()));
+    let allowed = copilot
+        .iter()
+        .find(|arg| arg.starts_with("--allow-tool="))
+        .unwrap();
+    assert!(
+        allowed.contains("wenlan") && !allowed.contains("write"),
+        "{allowed}"
+    );
+}
+
+#[test]
+fn only_tools_that_read_agent_skills_need_wenlans_skill_folder() {
+    let home = Path::new("/home/someone");
+    assert!(wenlan_skill_paths(RepoWikiAgent::Claude, home).is_empty());
+    assert!(wenlan_skill_paths(RepoWikiAgent::Codex, home).is_empty());
+    assert_eq!(
+        wenlan_skill_paths(RepoWikiAgent::Copilot, home),
+        [home.join(".copilot/skills/wenlan/SKILL.md")]
+    );
 }
 
 fn readme_fix(old: &str, new: &str) -> DocFixRequest {
