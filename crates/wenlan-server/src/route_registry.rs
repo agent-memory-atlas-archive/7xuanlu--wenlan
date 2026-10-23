@@ -424,6 +424,11 @@ const NON_SENSITIVE_PATHS: &[&str] = &[
     // A new-note commit returns a receipt only (outcome, note id and title,
     // citation counts); the list and the claim are in the sensitive catalog.
     "/api/steep/new/commit",
+    // A repository-bound Space names its Space in the path; the binding,
+    // suggest, publish and run routes return paths, counts and links, no
+    // page text.
+    "/api/spaces/{name}/wiki/repo", "/api/spaces/{name}/wiki/suggest",
+    "/api/spaces/{name}/wiki/publish", "/api/spaces/{name}/wiki/run",
 ];
 
 const NON_SENSITIVE_MIXED_ROUTES: &[(RegisteredMethod, &str)] = &[
