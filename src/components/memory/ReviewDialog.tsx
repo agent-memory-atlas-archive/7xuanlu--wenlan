@@ -22,6 +22,7 @@ import { reviewItemId, type ReviewItem } from "./useReviewQueue";
 import { PageMergeStripOff, usePageMergeEvidence } from "./ReviewPageMerge";
 import { MemoryRevisionChain, PageRevisionChain } from "./ReviewHistory";
 import SourceRepairReview from "./SourceRepairReview";
+import MarkdownDiff from "./MarkdownDiff";
 import { useActivity } from "../../lib/useActivity";
 import { STEEP_COMMAND, SteepNeedsAiToolError } from "../../lib/steepMode";
 
@@ -428,8 +429,10 @@ export function useReviewItemSummary(item: ReviewItem | null): {
   return { title: title ?? reviewKindLabel(t, item), reason, delta };
 }
 
+// A clear green, like the danger red beside it: the sage accent read as grey
+// behind rendered page text.
 const INS_STYLE: React.CSSProperties = {
-  backgroundColor: "color-mix(in srgb, var(--mem-accent-sage) 24%, transparent)",
+  backgroundColor: "rgba(76, 175, 106, 0.26)",
   textDecoration: "none",
   borderRadius: 3,
   padding: "0 2px",
@@ -452,6 +455,12 @@ const paneStyle: React.CSSProperties = {
   color: "var(--mem-text)",
   whiteSpace: "pre-wrap",
   overflowWrap: "anywhere",
+};
+
+/** A revision pane renders Markdown, so its own line breaks are not kept. */
+const markdownPaneStyle: React.CSSProperties = {
+  ...paneStyle,
+  whiteSpace: "normal",
 };
 
 const paneLabelStyle: React.CSSProperties = {
@@ -1417,28 +1426,38 @@ export default function ReviewDialog({
                     >
                       <div>
                         <p style={paneLabelStyle}>{t("review.current")}</p>
-                        <div style={paneStyle}>
-                          <DiffText
-                            segments={segments.filter(
-                              (segment) => segment.kind !== "ins",
-                            )}
+                        <div style={markdownPaneStyle}>
+                          <MarkdownDiff
+                            before={beforeContent}
+                            after={item.content}
+                            side="before"
+                            insStyle={INS_STYLE}
+                            delStyle={DEL_STYLE}
                           />
                         </div>
                       </div>
                       <div>
                         <p style={paneLabelStyle}>{t("review.proposed")}</p>
-                        <div style={paneStyle}>
-                          <DiffText
-                            segments={segments.filter(
-                              (segment) => segment.kind !== "del",
-                            )}
+                        <div style={markdownPaneStyle}>
+                          <MarkdownDiff
+                            before={beforeContent}
+                            after={item.content}
+                            side="after"
+                            insStyle={INS_STYLE}
+                            delStyle={DEL_STYLE}
                           />
                         </div>
                       </div>
                     </div>
                   ) : (
-                    <div style={paneStyle}>
-                      <DiffText segments={segments} />
+                    <div style={markdownPaneStyle}>
+                      <MarkdownDiff
+                        before={beforeContent}
+                        after={item.content}
+                        side="unified"
+                        insStyle={INS_STYLE}
+                        delStyle={DEL_STYLE}
+                      />
                     </div>
                   )}
 
