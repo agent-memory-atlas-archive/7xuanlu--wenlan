@@ -24,6 +24,9 @@ use wenlan_types::CodeBasisLocator;
 pub const OKF_VERSION: &str = "0.2";
 pub(crate) const MARKER_FILE: &str = ".wenlan-okf-export.json";
 const INDEX_FILE: &str = "index.md";
+/// The repository bundle's page list in reading order, which GitHub shows
+/// when someone opens the folder.
+const README_FILE: &str = "README.md";
 const PAGES_DIR: &str = "pages";
 const SOURCES_DIR: &str = "sources";
 
@@ -180,7 +183,7 @@ impl BundleDirs {
 
     /// The directory holding a validated marker entry, and its file name.
     fn locate<'a>(&self, entry: &'a str) -> std::io::Result<(&Dir, &'a str)> {
-        if entry == INDEX_FILE {
+        if entry == INDEX_FILE || entry == README_FILE {
             return Ok((&self.root, entry));
         }
         for (dir, handle) in [(PAGES_DIR, &self.pages), (SOURCES_DIR, &self.sources)] {
@@ -394,11 +397,11 @@ static WIKILINK_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 });
 
 /// True when `entry` names a file this exporter owns: `index.md`,
-/// `pages/<name>.md` or `sources/<name>.md` where `<name>` carries no `/`,
+/// `README.md`, `pages/<name>.md` or `sources/<name>.md` where `<name>` carries no `/`,
 /// `\` or `..` and has no leading dot. Anything else in a marker (a forged
 /// `../x.md`, an absolute path, a future key) is ignored, never deleted.
 pub(crate) fn marker_entry_is_safe(entry: &str) -> bool {
-    if entry == INDEX_FILE {
+    if entry == INDEX_FILE || entry == README_FILE {
         return true;
     }
     for dir in [PAGES_DIR, SOURCES_DIR] {
@@ -1030,6 +1033,124 @@ pub(crate) fn render_bundle_index(pages: &[Page], files: &HashMap<String, String
     crate::export::knowledge::render_index_for_entries(rows, "/pages/")
 }
 
+/// The repository bundle's `README.md`: a line saying Wenlan keeps the folder,
+/// in the pages' language, then the pages in reading order, overview first, then the pages in the order the overview lists them, then the rest
+/// by title. `index.md` stays the OKF index, sorted by title. The overview is
+/// the page whose `## Pages` section (`## 頁面`, `## 页面`) links the most
+/// other pages; without such a section, the page with the section linking the
+/// most. Links are bundle-root (`/pages/...`), made relative by the caller.
+fn render_repository_readme(pages: &[Page], files: &HashMap<String, String>) -> String {
+    use crate::export::knowledge::{index_entry_line, sanitize_index_field};
+    let mut exported: Vec<&Page> = pages.iter().filter(|p| files.contains_key(&p.id)).collect();
+    exported.sort_by(|a, b| a.title.cmp(&b.title).then_with(|| a.id.cmp(&b.id)));
+    let owned: Vec<Page> = exported.iter().map(|p| (*p).clone()).collect();
+    let owners = title_owner_map(&owned);
+
+    // (named `## Pages` section, links) of the best section so far.
+    let mut best: Option<((bool, usize), &Page, Vec<String>)> = None;
+    for page in &exported {
+        for (named, linked) in linked_sections(page, &owners) {
+            let score = (named, linked.len());
+            if !linked.is_empty() && best.as_ref().is_none_or(|(top, _, _)| score > *top) {
+                best = Some((score, page, linked));
+            }
+        }
+    }
+    let mut order: Vec<&str> = Vec::new();
+    if let Some((_, overview, linked)) = &best {
+        order.push(&overview.id);
+        for id in linked {
+            if !order.contains(&id.as_str()) {
+                order.push(id);
+            }
+        }
+    }
+    for page in &exported {
+        if !order.contains(&page.id.as_str()) {
+            order.push(&page.id);
+        }
+    }
+    let mut out = format!("{}\n\n", readme_credit(&exported));
+    for id in order {
+        let Some(page) = exported.iter().find(|p| p.id == id) else {
+            continue;
+        };
+        out.push_str(&index_entry_line(
+            &sanitize_index_field(&page.title),
+            "/pages/",
+            &files[&page.id],
+            &sanitize_index_field(page.summary.as_deref().unwrap_or_default()),
+        ));
+    }
+    out
+}
+
+/// The README's opening line, in the language most of the pages are written
+/// in: Traditional or Simplified Chinese when their titles and summaries are,
+/// English otherwise.
+fn readme_credit(pages: &[&Page]) -> &'static str {
+    // Common characters whose two forms differ, paired by position.
+    const TRADITIONAL: &str = "麼來個這們為時說會碼頁開關發對沒還進過實現應從後專檔資庫夾試測檢設圖讀寫據變數與運執錯單處務機認樣點門問題體長東話語學經間動瀾舊";
+    const SIMPLIFIED: &str = "么来个这们为时说会码页开关发对没还进过实现应从后专档资库夹试测检设图读写据变数与运执错单处务机认样点门问题体长东话语学经间动澜旧";
+    let text: String = pages
+        .iter()
+        .flat_map(|page| {
+            [
+                page.title.as_str(),
+                page.summary.as_deref().unwrap_or_default(),
+            ]
+        })
+        .collect();
+    let han = text
+        .chars()
+        .filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c))
+        .count();
+    let latin = text.chars().filter(char::is_ascii_alphabetic).count();
+    if han == 0 || han * 3 < latin {
+        return "Kept by [Wenlan](https://wenlan.app) from this repository's code. \
+                Each page ends with the code lines it relies on.";
+    }
+    let count = |set: &str| text.chars().filter(|c| set.contains(*c)).count();
+    if count(SIMPLIFIED) > count(TRADITIONAL) {
+        "这个文件夹由 [Wenlan](https://wenlan.app) 依据代码维护，每页结尾列出它依据的代码行。"
+    } else {
+        "這個資料夾由 [Wenlan](https://wenlan.app) 依程式碼維護，每頁結尾列出它依據的程式碼行。"
+    }
+}
+
+/// Each `## ` section of `page`: whether its heading names the page list, and
+/// the other exported pages its `[[links]]` reach, in order, once each.
+fn linked_sections(page: &Page, owners: &TitleOwners) -> Vec<(bool, Vec<String>)> {
+    let mut sections: Vec<(bool, Vec<String>)> = Vec::new();
+    for line in page.content.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            let heading = heading.trim();
+            let named =
+                heading.eq_ignore_ascii_case("pages") || heading == "頁面" || heading == "页面";
+            sections.push((named, Vec::new()));
+            continue;
+        }
+        let Some((_, linked)) = sections.last_mut() else {
+            continue;
+        };
+        for cap in WIKILINK_RE.captures_iter(line) {
+            if !cap[1].is_empty() {
+                continue;
+            }
+            let key = (
+                page.space.clone(),
+                crate::db::MemoryDB::page_title_key(cap[2].trim()),
+            );
+            if let Some(Some(id)) = owners.get(&key) {
+                if *id != page.id && !linked.contains(id) {
+                    linked.push(id.clone());
+                }
+            }
+        }
+    }
+    sections
+}
+
 /// Read the previous marker. `Ok(None)` means no marker (fresh directory
 /// rules apply); an unreadable or unparseable marker is a
 /// [`WenlanError::Conflict`] — never guess which files are ours.
@@ -1205,11 +1326,28 @@ fn export_okf_inner(
             ));
         }
     }
-    let (old_file_list, old_digests) = match old_marker {
+    let (old_file_list, mut old_digests) = match old_marker {
         Some(marker) => (marker.files, marker.digests),
         None => (Vec::new(), BTreeMap::new()),
     };
-    let old_files: HashSet<String> = old_file_list.into_iter().collect();
+    let mut old_files: HashSet<String> = old_file_list.into_iter().collect();
+
+    // A repository bundle's README.md is Wenlan's while nobody else has
+    // written there: absent, or the bytes the last export wrote. One a person
+    // wrote or edited is theirs from then on: never written, moved or
+    // removed, and no longer listed in the marker.
+    let readme = relative_links
+        && if old_files.contains(README_FILE) {
+            let ours =
+                bundle_file_state(target, README_FILE, &old_digests, None) == BundleFileState::Ours;
+            if !ours {
+                old_files.remove(README_FILE);
+                old_digests.remove(README_FILE);
+            }
+            ours
+        } else {
+            std::fs::symlink_metadata(target.join(README_FILE)).is_err()
+        };
 
     let planned_pairs = plan_page_filenames(pages);
     let id_to_file: HashMap<String, String> = planned_pairs.iter().cloned().collect();
@@ -1218,6 +1356,9 @@ fn export_okf_inner(
 
     let mut planned: HashSet<String> = HashSet::new();
     planned.insert(INDEX_FILE.to_string());
+    if readme {
+        planned.insert(README_FILE.to_string());
+    }
     for (_, file) in &planned_pairs {
         planned.insert(format!("{PAGES_DIR}/{file}"));
     }
@@ -1283,6 +1424,12 @@ fn export_okf_inner(
         INDEX_FILE.to_string(),
         render_bundle_index(pages, &id_to_file).into_bytes(),
     );
+    if readme {
+        planned_bytes.insert(
+            README_FILE.to_string(),
+            render_repository_readme(pages, &id_to_file).into_bytes(),
+        );
+    }
     if relative_links {
         for (path, bytes) in planned_bytes.iter_mut() {
             if let Ok(body) = std::str::from_utf8(bytes) {
@@ -1477,6 +1624,28 @@ fn export_okf_inner(
             log::warn!("[okf] {INDEX_FILE} changed after it was checked and was kept");
         }
     }
+    if readme {
+        let list = relative_bundle_links(
+            README_FILE,
+            &render_repository_readme(&written_pages, &id_to_file),
+        );
+        match write_bundle_file(
+            &dirs,
+            README_FILE,
+            list.as_bytes(),
+            &old_digests,
+            before_act,
+        )? {
+            BundleWrite::Written => {
+                new_digests.insert(README_FILE.to_string(), digest_of(list.as_bytes()));
+            }
+            // A person saved their own README after the check above: it stays,
+            // and the next run sees it as theirs and leaves it alone.
+            BundleWrite::Kept => {
+                log::warn!("[okf] {README_FILE} changed after it was checked and was kept");
+            }
+        }
+    }
     // A planned file that failed to write keeps whatever digest the previous
     // export recorded for it, so the next run can still tell an edit from the
     // bytes we left there. Digests for files this run removed are dropped:
@@ -1553,6 +1722,132 @@ mod tests {
             kind: "concept".to_string(),
             truth: None,
         }
+    }
+
+    fn repository_pages() -> Vec<Page> {
+        vec![
+            test_page("p-run", "How to run it", "Build it."),
+            test_page(
+                "p-map",
+                "Module map",
+                "## Parts\n\n- [[How to run it]]\n",
+            ),
+            test_page("p-zz", "Zebra notes", "Not in the plan."),
+            test_page(
+                "p-over",
+                "What Demo is",
+                "Demo does things.\n\n## Pages\n\n- [[Module map]]: parts\n- [[Not written yet]]: later\n- [[How to run it]]: start\n",
+            ),
+        ]
+    }
+
+    fn readme_titles(readme: &str) -> Vec<String> {
+        readme
+            .lines()
+            .filter_map(|line| line.strip_prefix("* ["))
+            .map(|line| line.split(']').next().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn repository_readme_starts_with_the_overview_then_its_page_order() {
+        let pages = repository_pages();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("wiki");
+        export_okf_for_repository(&pages, &target, &ConceptPathMap::new(), &HashMap::new())
+            .unwrap();
+        let readme = std::fs::read_to_string(target.join(README_FILE)).unwrap();
+        assert_eq!(
+            readme_titles(&readme),
+            ["What Demo is", "Module map", "How to run it", "Zebra notes"]
+        );
+        assert!(readme.contains("](pages/"), "{readme}");
+        assert!(
+            readme.starts_with("Kept by [Wenlan](https://wenlan.app) "),
+            "{readme}"
+        );
+        assert!(
+            !readme.starts_with("---"),
+            "no frontmatter on GitHub: {readme}"
+        );
+        let marker: ExportMarker =
+            serde_json::from_slice(&std::fs::read(target.join(MARKER_FILE)).unwrap()).unwrap();
+        assert!(marker.files.iter().any(|f| f == README_FILE));
+        assert!(marker.digests.contains_key(README_FILE));
+
+        // A plain export (not a repository bundle) writes no README.md.
+        let plain = dir.path().join("plain");
+        export_okf(&pages, &plain).unwrap();
+        assert!(!plain.join(README_FILE).exists());
+    }
+
+    #[test]
+    fn repository_readme_without_a_page_list_is_sorted_by_title() {
+        let pages = vec![
+            test_page("b", "Beta", "No links."),
+            test_page("a", "Alpha", "No links either."),
+        ];
+        let files: HashMap<String, String> = plan_page_filenames(&pages).into_iter().collect();
+        assert_eq!(
+            readme_titles(&render_repository_readme(&pages, &files)),
+            ["Alpha", "Beta"]
+        );
+    }
+
+    #[test]
+    fn repository_readme_credit_follows_the_pages_language() {
+        let files = |pages: &[Page]| -> HashMap<String, String> {
+            plan_page_filenames(pages).into_iter().collect()
+        };
+        let hant = vec![
+            test_page("a", "文瀾是什麼", "內容"),
+            test_page("b", "怎麼跑起來", "內容"),
+        ];
+        assert!(render_repository_readme(&hant, &files(&hant)).starts_with("這個資料夾由"));
+        let hans = vec![
+            test_page("a", "文澜是什么", "内容"),
+            test_page("b", "怎么跑起来", "内容"),
+        ];
+        assert!(render_repository_readme(&hans, &files(&hans)).starts_with("这个文件夹由"));
+    }
+
+    #[test]
+    fn repository_readme_a_person_wrote_or_edited_is_left_alone() {
+        let pages = repository_pages();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("wiki");
+        export_okf_for_repository(&pages, &target, &ConceptPathMap::new(), &HashMap::new())
+            .unwrap();
+
+        // Edited after Wenlan wrote it: theirs from then on.
+        std::fs::write(target.join(README_FILE), "My own intro\n").unwrap();
+        export_okf_for_repository(&pages, &target, &ConceptPathMap::new(), &HashMap::new())
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join(README_FILE)).unwrap(),
+            "My own intro\n"
+        );
+        assert!(!target.join(ARCHIVE_DIR).join(README_FILE).exists());
+        assert!(!target
+            .join(ARCHIVE_DIR)
+            .join(format!("{README_FILE}{ARCHIVE_SUFFIX}"))
+            .exists());
+        let marker: ExportMarker =
+            serde_json::from_slice(&std::fs::read(target.join(MARKER_FILE)).unwrap()).unwrap();
+        assert!(!marker.files.iter().any(|f| f == README_FILE));
+
+        // Still left alone on the next run, and fewer pages remove nothing of it.
+        export_okf_for_repository(
+            &pages[..1],
+            &target,
+            &ConceptPathMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join(README_FILE)).unwrap(),
+            "My own intro\n"
+        );
     }
 
     fn test_page_in_space(id: &str, title: &str, content: &str, space: Option<&str>) -> Page {
@@ -3401,6 +3696,44 @@ mod tests {
         assert!(std::fs::read_to_string(&index)
             .unwrap()
             .contains("alpha.md"));
+    }
+
+    /// A repository README saved after it was checked is the person's: kept by
+    /// this run, and left alone (not archived) by the next.
+    #[test]
+    fn readme_edit_saved_after_classification_is_kept_and_stays_theirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pages = repository_pages();
+        let no_paths = ConceptPathMap::new();
+        let no_sources = HashMap::new();
+        export_okf_for_repository(&pages, dir.path(), &no_paths, &no_sources).unwrap();
+        let readme = dir.path().join(README_FILE);
+
+        let stats = export_okf_inner(
+            &pages,
+            dir.path(),
+            &no_paths,
+            &no_sources,
+            true,
+            &mut |entry| {
+                if entry == README_FILE {
+                    save_by_replacing(&readme, "My own intro\n");
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&readme).unwrap(), "My own intro\n");
+        assert_eq!(stats.failed, 0, "{stats:?}");
+        export_okf_for_repository(&pages, dir.path(), &no_paths, &no_sources).unwrap();
+        assert_eq!(std::fs::read_to_string(&readme).unwrap(), "My own intro\n");
+        assert!(!dir.path().join(ARCHIVE_DIR).join(README_FILE).exists());
+        assert!(!dir
+            .path()
+            .join(ARCHIVE_DIR)
+            .join(format!("{README_FILE}{ARCHIVE_SUFFIX}"))
+            .exists());
+        assert!(private_names_in_bundle(dir.path()).is_empty());
     }
 
     /// Every `.md` file under `dir`, hidden directories included. This is what
