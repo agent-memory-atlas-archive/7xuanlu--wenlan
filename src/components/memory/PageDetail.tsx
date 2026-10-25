@@ -34,6 +34,7 @@ import {
   fetchWebpage,
   ingestWebpage,
   deleteFileChunks,
+  getChunks,
   listIndexedFiles,
   type Entity,
   type BasisConfirmOutcome,
@@ -87,8 +88,9 @@ import {
 } from "./editor/MarkdownEditor";
 import type { LinkCompletionNote } from "./editor/wikiLinkCompletion";
 import type { PastedSourceSaved } from "./editor/sourcePaste";
-import { sourceLinkIconMount, type SourceLinkIconActions } from "./editor/sourceLinkIcon";
+import { sourceLinkCardMount, sourceLinkIconMount, type SourceLinkIconActions } from "./editor/sourceLinkIcon";
 import { sourceLinkKey } from "./editor/sourceLinkKey";
+import { SHARE_PREVIEW_APPS, sharePreview as readSharePreview, sharePreviewTitle } from "./sources/sharePreview";
 import { getSourceAppFromUrl, sourceAppName, sourceHandleFromUrl, sourceLinkKind, type SourceApp } from "./sources/sourcePresentation";
 import { linkCompletionText, pageTitleKey, trimLikeDaemon } from "./editor/pageTitleKey";
 import { loadAllLinkCandidates, linkNotesFor } from "./page/linkCandidates";
@@ -249,6 +251,9 @@ function handleMenuKeyDown(
 
 /** Sites that show the daemon a sign-in page instead of the post or document. */
 const SIGN_IN_APPS: ReadonlySet<SourceApp> = new Set(["gmail", "slack", "x", "threads", "instagram", "xiaohongshu"]);
+const PRIVATE_APPS: ReadonlySet<SourceApp> = new Set(["gmail", "slack"]);
+// A note above an article about other pages, as Wikipedia puts first.
+const HATNOTE = /redirects here|^for other uses|^this article is about|^not to be confused with/i;
 
 export default function PageDetail({
   pageId,
@@ -617,22 +622,49 @@ export default function PageDetail({
   const { data: indexedFiles } = useQuery({ queryKey: ["indexedFiles"], queryFn: () => listIndexedFiles() });
   const sourceLinks = useMemo(() => new Map((indexedFiles ?? [])
     .filter((file) => file.source === "webpage")
-    .map((file) => [file.source_id, file.title] as const)), [indexedFiles]);
+    .map((file) => {
+      // Mail and chat are never read, so they have no words for a card.
+      const app = getSourceAppFromUrl(file.source_id);
+      return [file.source_id, { title: file.title, previewable: !app || !PRIVATE_APPS.has(app) }] as const;
+    })), [indexedFiles]);
   // A saved link's icon opens its source beside the page, as Sources does.
+  const savedWebSource = (url: string) => {
+    const webpages = (indexedFiles ?? []).filter((row) => row.source === "webpage");
+    return webpages.find((row) => row.source_id === url)
+      ?? webpages.find((row) => sourceLinkKey(row.source_id) === sourceLinkKey(url));
+  };
   const sourceIconActionsRef = useRef<SourceLinkIconActions | null>(null);
   sourceIconActionsRef.current = {
     label: t("sourcePaste.iconTitle"),
     open: (url) => {
-      const webpages = (indexedFiles ?? []).filter((row) => row.source === "webpage");
-      const file = webpages.find((row) => row.source_id === url)
-        ?? webpages.find((row) => sourceLinkKey(row.source_id) === sourceLinkKey(url));
+      const file = savedWebSource(url);
       if (!file) return;
       if (showCanvas) void requestToggleCanvas();
       changeCanvasWorkspaceExpanded(false);
       setSourcePreview(file);
     },
+    menu: {
+      showLink: t("sourcePaste.showLink"),
+      showPreview: t("sourcePaste.showPreview"),
+      openSource: t("sourcePaste.openSource"),
+      more: t("sourcePaste.moreActions"),
+      play: t("sourcePaste.playVideo"),
+    },
+    // A card's words: the saved page's opening, none when only its link was kept.
+    excerpt: async (url) => {
+      const file = savedWebSource(url);
+      if (!file) return null;
+      const chunks = await getChunks("webpage", file.source_id);
+      const text = [...chunks].sort((a, b) => a.chunk_index - b.chunk_index)[0]?.content ?? "";
+      // Footnote marks such as [1] mean nothing on a card.
+      const lines = text.split(/\n+/).map((line) => line.replace(/\[\d+\]/g, "").replace(/\s+/g, " ").trim()).filter(Boolean);
+      // The first sentence-like paragraph, past menus and language lists.
+      const first = lines.find((line) => line.length >= 60 && /[.!?:。！？：]/.test(line) && !HATNOTE.test(line)) ?? lines.join(" ");
+      return first && first !== file.source_id ? first.slice(0, 280) : null;
+    },
   };
   const [mountSourceIcon] = useState(() => sourceLinkIconMount(() => sourceIconActionsRef.current ?? { label: "", open: () => undefined }));
+  const [mountSourceCard] = useState(() => sourceLinkCardMount(() => sourceIconActionsRef.current ?? { label: "", open: () => undefined }));
 
   // Entities on this page = the page's own anchor entity plus the anchor
   // entities of its source memories. These are enrichment links, not search.
@@ -1821,18 +1853,41 @@ export default function PageDetail({
   // are kept; so is a page that could not be read.
   const savePastedSource = async (url: string, label?: string): Promise<PastedSourceSaved> => {
     const app = getSourceAppFromUrl(url);
-    const linkOnly = app !== null && SIGN_IN_APPS.has(app);
+    const signIn = app !== null && SIGN_IN_APPS.has(app);
+    const sharePreview = app !== null && SHARE_PREVIEW_APPS.has(app);
     let title = "";
     let content = "";
-    if (!linkOnly) {
+    if (!signIn || sharePreview) {
       try {
         const fetched = await fetchWebpage(url);
-        title = fetched.title.trim();
-        content = fetched.content.trim();
+        if (sharePreview && app) {
+          // Only what the site gives link previews; the rest is its sign-in wall.
+          const preview = readSharePreview(app, fetched);
+          if (preview) {
+            const short = sharePreviewTitle(preview.text);
+            title = preview.who ? t("sourcePaste.previewTitle", { who: preview.who, text: short }) : short;
+            content = preview.who ? t("sourcePaste.previewTitle", { who: preview.who, text: preview.text }) : preview.text;
+          }
+        } else if (app === "youtube") {
+          // YouTube can give a video another video's description, so only its
+          // name and channel are kept.
+          const name = fetched.title.trim().replace(/\s+-\s+YouTube$/, "");
+          const author = fetched.author?.trim();
+          if (name && name !== "YouTube") {
+            title = author && !name.toLowerCase().includes(author.toLowerCase())
+              ? t("sourcePaste.videoByTitle", { title: name, author })
+              : name;
+            content = title;
+          }
+        } else {
+          title = fetched.title.trim();
+          content = fetched.content.trim();
+        }
       } catch {
         // Saved as a link below.
       }
     }
+    const linkOnly = signIn && !content;
     const handle = sourceHandleFromUrl(url);
     const kind = sourceLinkKind(url);
     const appName = app ? sourceAppName(app, i18n.language) : "";
@@ -2623,6 +2678,7 @@ export default function PageDetail({
                   sourceLinks={sourceLinks}
                   onSavePastedSource={savePastedSource}
                   mountSourceIcon={mountSourceIcon}
+                  mountSourceCard={mountSourceCard}
                   referenceContext={editorReferenceContext}
                   onReferenceActivate={(target, anchor) => {
                     if (target.kind === "page") { dismissWikiLinkPreview(); onPageClick?.(target.id); }

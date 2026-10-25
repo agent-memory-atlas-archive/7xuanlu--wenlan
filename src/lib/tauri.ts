@@ -540,7 +540,11 @@ export interface FetchWebpageResponse {
   title: string;
   content: string;
   content_type: string;
-  extraction: "html_semantic" | "html_body" | "plain_text";
+  extraction: "html_semantic" | "html_body" | "plain_text" | "html_metadata";
+  /** The text the page gives link previews, when it has one. */
+  description?: string | null;
+  /** Who made the page, such as an article's byline or a video's channel. */
+  author?: string | null;
   untrusted: boolean;
 }
 
