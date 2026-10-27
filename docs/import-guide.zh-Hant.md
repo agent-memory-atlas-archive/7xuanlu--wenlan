@@ -4,7 +4,7 @@
 
 開啟「設定 → 來源」，依手上的資料選擇匯入方式。
 
-## 連接 Obsidian vault：唯讀
+## 連接 Obsidian vault
 
 1. 在「已連接的來源」選擇「新增來源…」（尚未連接時為「新增第一個來源」），再選「連接 Obsidian 庫」。
 2. 瀏覽並選取 vault 資料夾。
@@ -14,7 +14,14 @@
 
    之後可以在來源資訊裡用「持續同步」開關切換。想馬上更新，也可以在那裡按「重新整理」。
 
-Wenlan 讀取 vault 裡的 Markdown 筆記，不修改原始檔案。**變更只會讀入 Wenlan，不會寫回 Obsidian。**
+Wenlan 讀取 vault 裡的 Markdown 筆記，**沒有你同意，不會改動你原有的筆記**。整個 vault、每個資料夾和每篇筆記，在來源資訊裡都有「AI 修改」設定：
+
+- **不能改**（筆記的預設）：AI 只會引用這篇筆記。PDF 一律是「不能改」。
+- **先問我**：AI 可以提出修改建議。AI 想改的筆記會出現在首頁和選單列，你按「接受」才會寫進檔案。
+
+資料夾或筆記可以有自己的設定，以最接近的那一層為準。
+
+Wenlan 自己的筆記也可以放進 vault。來源資訊會顯示它們放在哪裡，並提供搬進 vault 的選項，搬過去後就能在 Obsidian 裡和你的筆記一起打開。Wenlan 重新開啟時會完成搬移。
 
 ## 連接 Logseq 圖譜：唯讀
 
@@ -45,4 +52,4 @@ Wenlan 讀取 `pages/` 和 `journals/` 裡的 Markdown 頁面。大綱會整理�
 
 如果你的 AI 工具讀得到 Gmail、Notion、Google Drive、Slack、GitHub 或網頁，可以請它把讀到的內容存進 Wenlan，例如「把這封信存進 Wenlan」。接上 Wenlan 外掛後，工具會連同原文連結一起存下，引用它的筆記就能點回原本的郵件或頁面。也可以用命令列存一份：`wenlan sources save --url <連結> --title <標題> --label gmail < email.txt`。
 
-Wenlan 保留存下的那一份，不會再去抓原文。原文更新後，請工具用同一個連結再存一次，Wenlan 會換成新的內容，並把引用它的筆記標記為需要更新。這要用本機工具，例如 Claude Code 或 Codex；claude.ai 和 ChatGPT 的網頁存取是唯讀的，無法存來源。
+Wenlan 保留存下的那一份，不會再去抓原文。原文更新後，請工具用同一個連結再存一次，Wenlan 會換成新的內容，並把引用它的筆記標記為需要更新。這要用本機工具，例如 Claude Code 或 Codex；claude.ai 和 ChatGPT 的網頁存取無法存來源，就算你允許那個 App 寫入也一樣。

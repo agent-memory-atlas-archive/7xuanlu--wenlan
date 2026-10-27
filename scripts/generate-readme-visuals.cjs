@@ -34,19 +34,23 @@ const BANNER = {
 
 const BANNER_COPY = {
   en: {
-    title: ["A living personal wiki"],
+    title: ["Your living wiki"],
+    tagline: "Free · Open source · Local-first",
     font: BANNER.latin,
   },
   "zh-Hant": {
-    title: ["持續更新的個人知識庫"],
+    title: ["持續更新的知識庫"],
+    tagline: "免費・開源・本地優先",
     font: '"PingFang TC", "Noto Sans TC", -apple-system, BlinkMacSystemFont, sans-serif',
   },
   "zh-Hans": {
-    title: ["持续更新的个人知识库"],
+    title: ["持续更新的知识库"],
+    tagline: "免费・开源・本地优先",
     font: '"PingFang SC", "Noto Sans SC", -apple-system, BlinkMacSystemFont, sans-serif',
   },
   "es-ES": {
-    title: ["Una wiki personal viva"],
+    title: ["Tu wiki viva"],
+    tagline: "Gratis · Código abierto · Local-first",
     font: BANNER.latin,
   },
 };
@@ -90,12 +94,26 @@ function makeSimpleBanner(viewport, locale) {
     `<text x="${x}" y="${y}" fill="${color}" font-family="${esc(copy.font)}" font-size="${size}" font-weight="${weight}" text-anchor="${anchor}"${letterSpacing === null ? "" : ` letter-spacing="${letterSpacing}"`}>${esc(value)}</text>`;
   const chineseName = locale === "zh-Hant" ? "文瀾" : locale === "zh-Hans" ? "文澜" : "";
   const brand = (x, y, size, anchor) =>
-    `<text x="${x}" y="${y}" fill="${BANNER.accent}" font-size="${size}" font-weight="500" text-anchor="${anchor}"><tspan font-family="${esc(BANNER.latin)}">Wenlan</tspan>${chineseName ? `<tspan dx="12" font-family="${esc(copy.font)}">${chineseName}</tspan>` : ""}</text>`;
+    `<text x="${x}" y="${y}" fill="${BANNER.accent}" font-size="${size}" font-weight="500" text-anchor="${anchor}"><tspan font-family="${esc(BANNER.latin)}">Wenlan</tspan>${chineseName ? `<tspan dx="${+(size * 0.25).toFixed(2)}" font-family="${esc(copy.font)}">${chineseName}</tspan>` : ""}</text>`;
+  const tagline = copy.tagline ?? null;
+  // With a tagline the three lines stay centred on the logo, and the tagline sits above the
+  // ring's lower edge: the dark tile blends into the background, so the ring is what reads.
+  // The Wenlan name and the title stay close in size, which reads as one heading.
   const content = mobile
-    ? `${logoMarkup({ x: 320, y: 32, size: 80, prefix })}
+    ? tagline
+      ? `${logoMarkup({ x: 320, y: chineseName ? 32 : 34, size: 80, prefix })}
+  ${brand(360, chineseName ? 146 : 148, chineseName ? 29.12 : 30.24, "middle")}
+  ${text(360, chineseName ? 186 : 183, copy.title[0], 30, BANNER.white, 500, "middle")}
+  ${text(360, chineseName ? 218 : 215, tagline, 18, BANNER.secondary, 400, "middle")}`
+      : `${logoMarkup({ x: 320, y: 32, size: 80, prefix })}
   ${brand(360, 150, chineseName ? 29.12 : 30.24, "middle")}
   ${text(360, 195, copy.title[0], 32, BANNER.white, 500, "middle")}`
-    : `${logoMarkup({ x: 81.28, y: 84.28, size: 181.44, prefix })}
+    : tagline
+      ? `${logoMarkup({ x: 81.28, y: 84.28, size: 181.44, prefix })}
+  ${brand(300, chineseName ? 141 : 146, chineseName ? 41.6 : 43.2, "start")}
+  ${text(300, chineseName ? 196 : 191, copy.title[0], 40, BANNER.white, 500, "start", chineseName ? 0.65 : null)}
+  ${text(300, chineseName ? 234 : 229, tagline, 20, BANNER.secondary, 400, "start", chineseName ? 0.65 : null)}`
+      : `${logoMarkup({ x: 81.28, y: 84.28, size: 181.44, prefix })}
   ${brand(300, 153, chineseName ? 41.6 : 43.2, "start")}
   ${text(300, 219, copy.title[0], 40, BANNER.white, 500, "start", chineseName ? 0.65 : null)}`;
 
@@ -116,7 +134,7 @@ function makeSimpleBanner(viewport, locale) {
     width,
     height,
     background: BANNER.dark,
-    requiredCopy: ["Wenlan", ...(chineseName ? [chineseName] : []), ...copy.title],
+    requiredCopy: ["Wenlan", ...(chineseName ? [chineseName] : []), ...copy.title, ...(tagline ? [tagline] : [])],
     svg,
   };
 }
@@ -252,7 +270,24 @@ async function renderSvgToPng(asset, pngPath) {
         }
       }
       for (const node of svg.querySelectorAll("text")) {
-        const box = node.getBBox();
+        // getBBox is in the text's own coordinates; map it through the parent transforms
+        // (the desktop banner's translate) so the check measures where it is drawn.
+        const local = node.getBBox();
+        const ctm = node.getCTM();
+        const corners = [
+          [local.x, local.y],
+          [local.x + local.width, local.y],
+          [local.x, local.y + local.height],
+          [local.x + local.width, local.y + local.height],
+        ].map(([x, y]) => new DOMPoint(x, y).matrixTransform(ctm));
+        const xs = corners.map((point) => point.x);
+        const ys = corners.map((point) => point.y);
+        const box = {
+          x: Math.min(...xs),
+          y: Math.min(...ys),
+          width: Math.max(...xs) - Math.min(...xs),
+          height: Math.max(...ys) - Math.min(...ys),
+        };
         if (
           box.x < -tolerance
           || box.y < -tolerance

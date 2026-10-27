@@ -4,7 +4,7 @@
 
 Open **Settings → Sources** and choose the route that matches your material.
 
-## Connect an Obsidian vault — read-only
+## Connect an Obsidian vault
 
 1. Under **Connected sources**, choose **Add source…** (or **Add your first source**), then **Connect Obsidian vault**.
 2. Browse to your vault folder.
@@ -14,7 +14,14 @@ Open **Settings → Sources** and choose the route that matches your material.
 
    You can switch later with **Keep in sync** in the source's info. To pick up a change right away, choose **Refresh** there.
 
-Wenlan reads the vault’s Markdown notes without changing the original files. **Changes flow one way, into Wenlan; nothing is written back to Obsidian.**
+Wenlan reads the vault’s Markdown notes and **never edits them without your OK**. The vault, each folder, and each note have an **AI changes** setting in the source's info:
+
+- **Never** (where your notes start): AI only cites the note. PDFs are always Never.
+- **Ask me first**: AI can suggest a change. Notes an AI wants to change appear on the home and in the menu bar, and the file changes only when you choose **Accept**.
+
+A folder or a note can have its own setting; the nearest one wins.
+
+Wenlan's own pages can live in the vault too. The source's info shows where they are and offers to move them into the vault, so they open in Obsidian next to your notes. Wenlan finishes the move when it reopens.
 
 ## Connect a Logseq graph — read-only
 
@@ -43,6 +50,6 @@ Use this for concise preferences, decisions, facts, or lessons you already have.
 
 ## Save an email, page, or thread through your AI tool
 
-If your AI tool can read Gmail, Notion, Google Drive, Slack, GitHub, or the web, ask it to keep what it read in Wenlan, for example "save this email to Wenlan". With the Wenlan plugin connected, the tool saves the text together with a link to the original, so notes that cite it open the email or page it came from. You can also save one from the command line: `wenlan sources save --url <link> --title <title> --label gmail < email.txt`.
+If your AI tool can read Gmail, Notion, Google Drive, Slack, GitHub, or the web, ask it to keep what it read in Wenlan, for example "save this email to Wenlan". With the Wenlan plugin connected, the tool saves the text together with a link to the original, so pages that cite it open the email or page it came from. You can also save one from the command line: `wenlan sources save --url <link> --title <title> --label gmail < email.txt`.
 
-Wenlan keeps the copy that was saved and does not fetch the original again. When the original changes, ask your tool to save it again with the same link; Wenlan replaces the copy and marks the notes that rely on it for refresh. This works from a local tool such as Claude Code or Codex. Web access for claude.ai and ChatGPT is read-only, so it cannot save sources.
+Wenlan keeps the copy that was saved and does not fetch the original again. When the original changes, ask your tool to save it again with the same link; Wenlan replaces the copy and marks the pages that rely on it for refresh. This works from a local tool such as Claude Code or Codex. Web access for claude.ai and ChatGPT cannot save sources, even for an app you allowed to write.
