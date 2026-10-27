@@ -259,6 +259,8 @@ const en = {
     connectionTitle: "Could not reach the background service",
     connectionProblem:
       "Wenlan could not reach its background service while starting up.",
+    preflightRepairTitle: "Wenlan couldn't repair its startup configuration",
+    preflightRepairBody: "Quit Wenlan, then reopen it to try the repair again.",
     fallbackLabel: "Service not running",
     fallbackBody: "Wenlan works, but nothing syncs until the service starts.",
     startService: "Start service",
@@ -1272,6 +1274,8 @@ const en = {
         "This run uses a separate data directory, so the service is left alone. Restart it yourself.",
       stillMismatched:
         "The service restarted but still reports an older version. Check how the service is installed, then try again.",
+      sidecarStopUnconfirmed:
+        "Wenlan couldn't confirm the background service stopped. Try again to finish restarting it.",
     },
   },
   settings: {
@@ -3255,6 +3259,8 @@ const zhHans = {
     stillWaiting: "仍在等待文澜的后台服务响应。",
     connectionTitle: "无法连接到后台服务",
     connectionProblem: "启动时文澜无法连接到后台服务。",
+    preflightRepairTitle: "文澜无法修复启动配置",
+    preflightRepairBody: "请退出文澜后重新打开，再试一次修复。",
     fallbackLabel: "后台服务没有在运行",
     fallbackBody: "文澜可以用，但在服务启动之前不会同步。",
     startService: "启动服务",
@@ -4241,6 +4247,8 @@ const zhHans = {
         "本次运行使用了单独的数据目录，因此不会改动该服务。请自行重启它。",
       stillMismatched:
         "服务已重启，但仍报告较旧的版本。请检查服务的安装方式，然后再试一次。",
+      sidecarStopUnconfirmed:
+        "文澜无法确认后台服务已经停止。请再试一次，完成服务重启。",
     },
   },
   settings: {
@@ -6191,6 +6199,8 @@ const zhHant = {
     stillWaiting: "仍在等待文瀾的背景服務回應。",
     connectionTitle: "無法連線到背景服務",
     connectionProblem: "啟動時文瀾無法連線到背景服務。",
+    preflightRepairTitle: "文瀾無法修復啟動設定",
+    preflightRepairBody: "請退出文瀾後重新開啟，再試一次修復。",
     fallbackLabel: "背景服務沒有在執行",
     fallbackBody: "文瀾可以用，但在服務啟動之前不會同步。",
     startService: "啟動服務",
@@ -7177,6 +7187,8 @@ const zhHant = {
         "本次執行使用了獨立的資料目錄，因此不會更動該服務。請自行重新啟動它。",
       stillMismatched:
         "服務已重新啟動，但仍回報較舊的版本。請檢查服務的安裝方式，然後再試一次。",
+      sidecarStopUnconfirmed:
+        "無法確認文瀾的背景服務已停止。請再試一次，以完成服務重新啟動。",
     },
   },
   settings: {

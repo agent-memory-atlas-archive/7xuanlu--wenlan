@@ -258,4 +258,8 @@ describe("review command contract", () => {
     expect(contract.has("review_page")).toBe(true);
     expect(contract.has("page_review_supported")).toBe(true);
   });
+
+  it("includes the shared app shell startup preflight in the Review contract", () => {
+    expect(contract.has("get_startup_preflight_status")).toBe(true);
+  });
 });

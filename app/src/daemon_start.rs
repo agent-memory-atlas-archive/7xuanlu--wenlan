@@ -20,7 +20,7 @@
 //! [`last_sidecar_stop`]. Nothing may assume either guarantee held without
 //! asking.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri_plugin_shell::process::CommandChild;
@@ -31,18 +31,48 @@ use crate::state::AppState;
 mod repair_runtime;
 pub use repair_runtime::resume_repair_runtime;
 
-/// Whether `setup()`'s server-plist preflight repair succeeded. Set once at
-/// startup and read by the on-demand command, which must not re-run the
-/// *mutating* preflight (that would be plist management from a user click).
-static STARTUP_PREFLIGHT_OK: AtomicBool = AtomicBool::new(false);
+/// Whether the server-plist preflight has settled. The frontend reads this
+/// before the daemon-backed first-run gate so a known terminal failure can be
+/// shown immediately without shortening the ordinary cold-start wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupPreflightStatus {
+    Pending = 0,
+    Ready = 1,
+    Failed = 2,
+}
+
+static STARTUP_PREFLIGHT_STATUS: AtomicU8 = AtomicU8::new(StartupPreflightStatus::Pending as u8);
+
+fn startup_preflight_status_for(ok: bool) -> StartupPreflightStatus {
+    if ok {
+        StartupPreflightStatus::Ready
+    } else {
+        StartupPreflightStatus::Failed
+    }
+}
 
 /// Record the startup preflight outcome for the on-demand command to consult.
 pub fn set_startup_preflight_ok(ok: bool) {
-    STARTUP_PREFLIGHT_OK.store(ok, Ordering::Relaxed);
+    let status = startup_preflight_status_for(ok);
+    STARTUP_PREFLIGHT_STATUS.store(status as u8, Ordering::Release);
 }
 
 fn startup_preflight_ok() -> bool {
-    STARTUP_PREFLIGHT_OK.load(Ordering::Relaxed)
+    startup_preflight_status() == StartupPreflightStatus::Ready
+}
+
+fn startup_preflight_status() -> StartupPreflightStatus {
+    match STARTUP_PREFLIGHT_STATUS.load(Ordering::Acquire) {
+        1 => StartupPreflightStatus::Ready,
+        2 => StartupPreflightStatus::Failed,
+        _ => StartupPreflightStatus::Pending,
+    }
+}
+
+#[tauri::command]
+pub fn get_startup_preflight_status() -> StartupPreflightStatus {
+    startup_preflight_status()
 }
 
 /// Whether this app has ever spawned a sidecar without being able to measure
@@ -1192,6 +1222,24 @@ const VERSION_HEAL_REPOLL_LIMIT: Duration = Duration::from_secs(10);
 pub const RESTART_ERROR_NOT_OWNED: &str = "daemon-restart:not-owned";
 pub const RESTART_ERROR_ISOLATED: &str = "daemon-restart:isolated";
 pub const RESTART_ERROR_STILL_MISMATCHED: &str = "daemon-restart:still-mismatched";
+const RESTART_ERROR_SIDECAR_STILL_RUNNING: &str = "daemon-restart:sidecar-still-running";
+const RESTART_ERROR_SIDECAR_STOP_UNVERIFIED: &str = "daemon-restart:sidecar-stop-unverified";
+
+/// Only a measured exit is enough to put a replacement on the sidecar's port.
+/// A failed measurement leaves the recorded process owned by this app and
+/// available for another stop attempt.
+fn sidecar_respawn_error(outcome: &SidecarStopOutcome) -> Option<String> {
+    match outcome {
+        SidecarStopOutcome::Ended => None,
+        SidecarStopOutcome::NoSidecar => Some(RESTART_ERROR_NOT_OWNED.to_string()),
+        SidecarStopOutcome::StillRunning { reason } => {
+            Some(format!("{RESTART_ERROR_SIDECAR_STILL_RUNNING}: {reason}"))
+        }
+        SidecarStopOutcome::CouldNotMeasure { reason } => {
+            Some(format!("{RESTART_ERROR_SIDECAR_STOP_UNVERIFIED}: {reason}"))
+        }
+    }
+}
 
 /// One self-heal at a time. The startup health poll and the banner's
 /// "Restart service" button both run [`heal_version_mismatch`]; a click while
@@ -1220,13 +1268,17 @@ pub struct DaemonVersionStatus {
     pub matched: bool,
     pub owner: &'static str,
     pub program: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restarted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// The outcome of one self-heal attempt, emitted as `daemon://version` and
 /// returned by `restart_daemon` as the new version (or a typed error).
 /// `restarted` says an attempt was made, not that it worked — check
 /// `matched`. `error` carries the failure for the banner's inline message.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DaemonVersionReport {
     pub daemon: String,
     pub app: String,
@@ -1255,21 +1307,75 @@ fn versions_match(daemon: &str, app: &str) -> bool {
     crate::release_part(daemon) == crate::release_part(app)
 }
 
+// A fast startup failure can finish before the webview subscribes. Retain its
+// outcome for the read-only status command; live health always takes priority.
+fn last_version_failure() -> &'static Mutex<Option<DaemonVersionReport>> {
+    static FAILURE: std::sync::OnceLock<Mutex<Option<DaemonVersionReport>>> =
+        std::sync::OnceLock::new();
+    FAILURE.get_or_init(|| Mutex::new(None))
+}
+
+fn status_with_recovery_failure(
+    live: Result<DaemonVersionStatus, String>,
+    failure: Option<DaemonVersionReport>,
+    app: &str,
+) -> Result<DaemonVersionStatus, String> {
+    let Some(failure) = failure.filter(|report| {
+        !report.matched && report.app == app && (report.restarted || report.error.is_some())
+    }) else {
+        return live;
+    };
+    match live {
+        Ok(mut current) => {
+            if !current.matched && versions_match(&current.daemon, &failure.daemon) {
+                current.restarted = Some(failure.restarted);
+                current.error = failure.error;
+            }
+            Ok(current)
+        }
+        Err(_) => Ok(DaemonVersionStatus {
+            daemon: failure.daemon,
+            app: failure.app,
+            matched: false,
+            owner: failure.owner,
+            program: failure.program,
+            restarted: Some(failure.restarted),
+            error: failure.error,
+        }),
+    }
+}
+
 /// Read the current daemon/app version report without restarting anything.
 pub async fn daemon_version_status_report(
     client: &crate::api::WenlanClient,
 ) -> Result<DaemonVersionStatus, String> {
-    let daemon = client.health().await?.version;
     let app = app_release();
-    let ownership =
-        crate::lifecycle::launchd_owns_server_daemon(&crate::lifecycle::SystemLaunchctl);
-    Ok(DaemonVersionStatus {
-        matched: versions_match(&daemon, &app),
-        daemon,
-        app,
-        owner: daemon_version_owner_label(ownership),
+    let observed_failure = last_version_failure()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let live = client.health().await.map(|health| DaemonVersionStatus {
+        matched: versions_match(&health.version, &app),
+        daemon: health.version,
+        app: app.clone(),
+        owner: daemon_version_owner_label(crate::lifecycle::launchd_owns_server_daemon(
+            &crate::lifecycle::SystemLaunchctl,
+        )),
         program: crate::lifecycle::server_plist_program_outside_bundle(),
-    })
+        restarted: None,
+        error: None,
+    });
+    let failure = {
+        let mut cached = last_version_failure()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Do not erase a newer failure that arrived during this health read.
+        if live.as_ref().is_ok_and(|status| status.matched) && *cached == observed_failure {
+            *cached = None;
+        }
+        cached.clone()
+    };
+    status_with_recovery_failure(live, failure, &app)
 }
 
 /// Re-poll `/api/health` until its release matches the app's, or the bounded
@@ -1385,9 +1491,10 @@ pub async fn heal_version_mismatch(
             // no sidecar to stop belongs to another process (an older app
             // still running, or a separate install): a respawn would meet
             // the held port and exit, so report without an attempt.
-            if matches!(stop_sidecar().await, SidecarStopOutcome::NoSidecar) {
+            let stop_outcome = stop_sidecar().await;
+            if let Some(error) = sidecar_respawn_error(&stop_outcome) {
                 log::warn!(
-                    "[daemon-version] no app-owned sidecar to restart; the mismatched daemon belongs to another process"
+                    "[daemon-version] refusing sidecar respawn because stop was not confirmed: {stop_outcome:?}"
                 );
                 return DaemonVersionReport {
                     daemon: daemon_version.to_string(),
@@ -1395,7 +1502,7 @@ pub async fn heal_version_mismatch(
                     matched: false,
                     restarted: false,
                     owner: owner_label(owner),
-                    error: Some(RESTART_ERROR_NOT_OWNED.to_string()),
+                    error: Some(error),
                     program,
                 };
             }
@@ -1449,6 +1556,16 @@ fn owner_label(owner: crate::lifecycle::VersionMismatchOwner) -> &'static str {
 /// `matched`, renders on `!matched`.
 pub fn emit_daemon_version(app: &tauri::AppHandle, report: &DaemonVersionReport) {
     use tauri::Emitter;
+    {
+        let mut failure = last_version_failure()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if report.matched {
+            *failure = None;
+        } else if report.restarted || report.error.is_some() {
+            *failure = Some(report.clone());
+        }
+    }
     if let Err(e) = app.emit(DAEMON_VERSION_EVENT, report) {
         log::warn!("[daemon-version] failed to emit {DAEMON_VERSION_EVENT}: {e}");
     }
@@ -1531,8 +1648,12 @@ pub async fn restart_daemon_to_move_pages(
         }
         crate::lifecycle::VersionMismatchAction::RespawnSidecar => {
             log::info!("[pages-folder] respawning the app-owned sidecar to move pages");
-            if matches!(stop_sidecar().await, SidecarStopOutcome::NoSidecar) {
-                return Err(RESTART_ERROR_NOT_OWNED.to_string());
+            let stop_outcome = stop_sidecar().await;
+            if let Some(error) = sidecar_respawn_error(&stop_outcome) {
+                log::warn!(
+                    "[pages-folder] refusing sidecar respawn because stop was not confirmed: {stop_outcome:?}"
+                );
+                return Err(error);
             }
             respawn_sidecar_for_version_heal(
                 &app,
@@ -1576,6 +1697,94 @@ mod version_heal_tests {
     }
 
     #[test]
+    fn sidecar_respawn_requires_a_confirmed_end() {
+        assert_eq!(sidecar_respawn_error(&SidecarStopOutcome::Ended), None);
+        assert_eq!(
+            sidecar_respawn_error(&SidecarStopOutcome::NoSidecar),
+            Some(RESTART_ERROR_NOT_OWNED.to_string())
+        );
+        assert_eq!(
+            sidecar_respawn_error(&SidecarStopOutcome::StillRunning {
+                reason: "pid still alive".to_string(),
+            }),
+            Some("daemon-restart:sidecar-still-running: pid still alive".to_string())
+        );
+        assert_eq!(
+            sidecar_respawn_error(&SidecarStopOutcome::CouldNotMeasure {
+                reason: "permission denied".to_string(),
+            }),
+            Some("daemon-restart:sidecar-stop-unverified: permission denied".to_string())
+        );
+    }
+
+    fn live_status(daemon: &str) -> DaemonVersionStatus {
+        DaemonVersionStatus {
+            daemon: daemon.into(),
+            app: "0.18.2".into(),
+            matched: daemon == "0.18.2",
+            owner: "launchd",
+            program: None,
+            restarted: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn status_recovers_failure_emitted_before_listener_while_daemon_offline() {
+        let status = status_with_recovery_failure(
+            Err("connection refused".into()),
+            Some(report(false, true, Some("restart failed"))),
+            "0.18.2",
+        )
+        .unwrap();
+        assert!(!status.matched);
+        assert_eq!(status.restarted, Some(true));
+        assert_eq!(status.error.as_deref(), Some("restart failed"));
+    }
+
+    #[test]
+    fn live_health_overrides_stale_recovery_failure() {
+        for daemon in ["0.18.2", "0.18.0"] {
+            let status = status_with_recovery_failure(
+                Ok(live_status(daemon)),
+                Some(report(false, true, Some("old failure"))),
+                "0.18.2",
+            )
+            .unwrap();
+            assert_eq!(status.daemon, daemon);
+            assert!(status.error.is_none());
+            assert!(status.restarted.is_none());
+        }
+    }
+
+    #[test]
+    fn unchanged_mismatch_retains_terminal_outcome_even_without_error() {
+        let status = status_with_recovery_failure(
+            Ok(live_status("0.18.1")),
+            Some(report(false, true, None)),
+            "0.18.2",
+        )
+        .unwrap();
+        assert_eq!(status.restarted, Some(true));
+        assert!(!status.matched);
+    }
+
+    #[test]
+    fn report_only_or_wrong_app_cannot_mask_unavailable_health() {
+        for (cached, app) in [
+            (report(false, false, None), "0.18.2"),
+            (report(false, true, Some("failure")), "0.18.3"),
+        ] {
+            assert!(status_with_recovery_failure(
+                Err("connection refused".into()),
+                Some(cached),
+                app,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn restart_outcome_maps_each_report_shape() {
         assert_eq!(
             restart_outcome(&report(true, true, None)),
@@ -1612,6 +1821,34 @@ mod version_heal_tests {
 mod tests {
     use super::*;
     use crate::lifecycle::LaunchdOwnership;
+
+    #[test]
+    fn startup_preflight_status_has_stable_wire_values() {
+        assert_eq!(
+            serde_json::to_string(&StartupPreflightStatus::Pending).unwrap(),
+            "\"pending\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StartupPreflightStatus::Ready).unwrap(),
+            "\"ready\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StartupPreflightStatus::Failed).unwrap(),
+            "\"failed\""
+        );
+    }
+
+    #[test]
+    fn startup_preflight_result_maps_only_success_to_ready() {
+        assert_eq!(
+            startup_preflight_status_for(true),
+            StartupPreflightStatus::Ready
+        );
+        assert_eq!(
+            startup_preflight_status_for(false),
+            StartupPreflightStatus::Failed
+        );
+    }
 
     // Port-health wins over everything: a daemon that came back on its own must
     // never be double-spawned, even if launchd or preflight would say otherwise.
@@ -1992,7 +2229,8 @@ mod tests {
         let binding = JobBinding::Unbound {
             reason: "restricted token".to_string(),
         };
-        install_sidecar_for_test(identity_of(&helper), binding.clone());
+        let identity = identity_of(&helper);
+        install_sidecar_for_test(identity, binding.clone());
 
         let first = stop_sidecar().await;
 
@@ -2002,8 +2240,14 @@ mod tests {
         );
         assert_eq!(
             sidecar_job_binding(),
-            Some(binding),
+            Some(binding.clone()),
             "the wire must keep reporting the real binding while the daemon is up"
+        );
+        assert!(sidecar_respawn_error(&first).is_some());
+        assert_eq!(
+            identity.presence(),
+            ProcessPresence::Running,
+            "the real original process must still be tracked after a failed stop"
         );
 
         let second = stop_sidecar().await;
@@ -2019,10 +2263,25 @@ mod tests {
             "the recorded failure was replaced: {:?}",
             last_sidecar_stop()
         );
+        assert!(sidecar_respawn_error(&second).is_some());
+
+        let _ = helper.kill();
+        helper.wait().expect("reap the original helper");
+
+        // The same tracked identity now measures as ended. Only this result
+        // may release the sidecar slot and let a replacement be installed.
+        let confirmed_end = stop_sidecar().await;
+        assert_eq!(confirmed_end, SidecarStopOutcome::Ended);
+        assert_eq!(sidecar_respawn_error(&confirmed_end), None);
+        assert_eq!(sidecar_job_binding(), None);
+
+        let mut replacement = spawn_a_live_process();
+        install_sidecar_for_test(identity_of(&replacement), binding.clone());
+        assert_eq!(sidecar_job_binding(), Some(binding));
 
         clear_sidecar_for_test();
-        let _ = helper.kill();
-        let _ = helper.wait();
+        let _ = replacement.kill();
+        let _ = replacement.wait();
     }
 
     /// Defect 2, end to end. The port-release path reported one immediate

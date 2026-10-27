@@ -113,6 +113,77 @@ describe("ServiceStatus", () => {
     expect(popover).toHaveTextContent("/opt/homebrew/bin/wenlan-server");
   });
 
+  it("shows an automatic recovery failure and leaves the retry action available", () => {
+    setVersionReport({ ...OUT_OF_DATE, restarted: true, error: "daemon-restart:still-mismatched" });
+    renderStatus(<ServiceStatus compact />);
+    expect(screen.getByRole("alert")).toHaveTextContent(SERVICE.errors.stillMismatched);
+    expect(action()).toHaveTextContent(SERVICE.restart);
+    expect(row()).toHaveAttribute("data-kind", "outOfDate");
+  });
+
+  it.each([
+    "daemon-restart:sidecar-still-running: pid still alive",
+    "daemon-restart:sidecar-stop-unverified: permission denied",
+  ])("explains how to recover when the app cannot confirm its sidecar stopped (%s)", (error) => {
+    setVersionReport({ ...OUT_OF_DATE, restarted: false, error });
+    renderStatus(<ServiceStatus compact />);
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent(SERVICE.errors.sidecarStopUnconfirmed);
+    expect(alert).not.toHaveTextContent("pid still alive");
+    expect(alert).not.toHaveTextContent("permission denied");
+    expect(action()).toBeEnabled();
+  });
+
+  it("keeps raw service-manager diagnostics out of the notice", () => {
+    const rawError = `launchctl print gui/501/com.wenlan.server\n${"diagnostic line\n".repeat(80)}`;
+    setVersionReport({ ...OUT_OF_DATE, restarted: true, error: rawError });
+    renderStatus(<ServiceStatus compact />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent(BOOT.startFailed);
+    expect(screen.getByRole("alert")).not.toHaveTextContent("launchctl print");
+    expect(screen.getByRole("alert").textContent?.length).toBeLessThan(100);
+  });
+
+  it("uses the typed still-mismatched message when a terminal report has no detail", () => {
+    setVersionReport({ ...OUT_OF_DATE, restarted: true, error: null });
+    renderStatus(<ServiceStatus compact />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent(SERVICE.errors.stillMismatched);
+  });
+
+  it("shows a failed automatic version recovery while the startup gate is still waiting", () => {
+    act(() => setDaemonStartupPhase("starting"));
+    setVersionReport({ ...OUT_OF_DATE, restarted: true, error: "daemon-restart:still-mismatched" });
+
+    renderStatus(<ServiceStatus compact />);
+
+    expect(row()).toHaveAttribute("data-kind", "outOfDate");
+    expect(screen.getByRole("alert")).toHaveTextContent(SERVICE.errors.stillMismatched);
+    expect(action()).toBeEnabled();
+  });
+
+  it("keeps the version retry action when startup later gives up", () => {
+    act(() => setDaemonStartupPhase("failed"));
+    setVersionReport({ ...OUT_OF_DATE, restarted: true, error: "daemon-restart:still-mismatched" });
+
+    renderStatus(<ServiceStatus />);
+
+    expect(row()).toHaveAttribute("data-kind", "outOfDate");
+    expect(screen.getByRole("alert")).toHaveTextContent(SERVICE.errors.stillMismatched);
+    expect(action()).toBeEnabled();
+  });
+
+  it("keeps an ordinary mismatch quiet while the startup gate is still waiting", () => {
+    act(() => setDaemonStartupPhase("starting"));
+    setVersionReport(OUT_OF_DATE);
+
+    renderStatus(<ServiceStatus />);
+
+    expect(screen.getByTestId("service-status-starting")).toBeInTheDocument();
+    expect(screen.queryByTestId("service-status")).not.toBeInTheDocument();
+  });
+
   it("goes quiet by itself when the problem goes away", () => {
     setVersionReport(OUT_OF_DATE);
     renderStatus(<ServiceStatus />);
@@ -132,12 +203,24 @@ describe("ServiceStatus", () => {
 
   it("restarts an out-of-date service and clears the report", async () => {
     setVersionReport(OUT_OF_DATE);
-    renderStatus(<ServiceStatus />);
+    const { invalidate } = renderStatus(<ServiceStatus />);
 
     fireEvent.click(action());
 
     await waitFor(() => expect(screen.queryByTestId("service-status")).not.toBeInTheDocument());
     expect(restartDaemonMock).toHaveBeenCalledTimes(1);
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["shouldShowWizard"] });
+  });
+
+  it.each(["starting", "failed"] as const)("refreshes the startup gate after a version retry succeeds while %s", async (phase) => {
+    act(() => setDaemonStartupPhase(phase));
+    setVersionReport({ ...OUT_OF_DATE, restarted: true, error: "daemon-restart:still-mismatched" });
+    const { invalidate } = renderStatus(<ServiceStatus />);
+
+    fireEvent.click(action());
+
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["shouldShowWizard"] }));
+    await waitFor(() => expect(getServiceNotices().version).toBeNull());
   });
 
   it("says why a restart failed, in the shared words", async () => {

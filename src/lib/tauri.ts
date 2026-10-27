@@ -301,6 +301,9 @@ export interface DaemonVersionStatus {
   matched: boolean;
   owner: "launchd" | "sidecar" | "unknown";
   program?: string | null;
+  /** Retained recovery outcome, including an event emitted before UI startup. */
+  restarted?: boolean;
+  error?: string | null;
 }
 
 /** Outcome of one self-heal attempt, emitted as `daemon://version`. */
@@ -3915,6 +3918,15 @@ export type DaemonStartResult =
  *  or a launchd-managed daemon is never double-spawned. */
 export async function startDaemonSidecar(): Promise<DaemonStartResult> {
   return invoke("start_daemon_sidecar");
+}
+
+/** Startup's LaunchAgent preflight state, read without waiting for the daemon.
+ *  A terminal failure lets first-run UI explain the required app restart while
+ *  ordinary cold starts continue through the daemon-backed boot gate. */
+export type StartupPreflightStatus = "pending" | "ready" | "failed";
+
+export async function getStartupPreflightStatus(): Promise<StartupPreflightStatus> {
+  return invoke("get_startup_preflight_status");
 }
 
 // ===== Onboarding Journey Milestones =====

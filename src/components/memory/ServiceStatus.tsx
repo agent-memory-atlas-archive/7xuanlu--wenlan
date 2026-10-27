@@ -115,7 +115,11 @@ function warningCopy(kind: WarningKind, { version }: ServiceNotices, t: TFunctio
 
 /** Runs the warning's one action. Resolves with the text to show when it did
  *  not fix things, or null when it did. */
-async function runAction(kind: WarningKind, queryClient: QueryClient, t: TFunction): Promise<string | null> {
+async function runAction(
+  kind: WarningKind,
+  queryClient: QueryClient,
+  t: TFunction,
+): Promise<string | null> {
   if (kind === "notRunning") {
     const result = await startDaemonSidecar();
     if (result.status === "failed") return `${t("boot.startFailed")} ${result.message}`;
@@ -126,11 +130,12 @@ async function runAction(kind: WarningKind, queryClient: QueryClient, t: TFuncti
     return null;
   }
   await restartDaemon();
-  if (kind === "notAnswering") {
-    // Asking the gate again puts the workspace back to "starting": the row
-    // goes back to the quiet line, and returns only if that attempt fails.
+  if (kind === "notAnswering" || kind === "outOfDate") {
+    // Re-read the gate after a successful retry so a manual version repair
+    // releases any daemon calls that are still waiting for startup.
     void queryClient.invalidateQueries({ queryKey: ["shouldShowWizard"] });
-  } else {
+  }
+  if (kind !== "notAnswering") {
     setVersionReport(null);
   }
   return null;
@@ -157,6 +162,19 @@ function ServiceWarning({
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverId = useId();
   const copy = warningCopy(kind, notices, t);
+  const terminalVersionFailure = kind === "outOfDate" && notices.version && !notices.version.matched && (
+    ("restarted" in notices.version && notices.version.restarted === true) ||
+    ("error" in notices.version && Boolean(notices.version.error))
+  );
+  const reportError = terminalVersionFailure && "error" in notices.version
+    ? notices.version.error
+    : null;
+  const reportErrorKey = reportError ? restartErrorKey(reportError) : null;
+  const visibleFailure = failure ?? (terminalVersionFailure
+    ? reportError
+      ? reportErrorKey ? t(reportErrorKey) : t("boot.startFailed")
+      : t("daemonService.errors.stillMismatched")
+    : null);
 
   useEffect(() => {
     if (!expanded) return;
@@ -177,7 +195,7 @@ function ServiceWarning({
     } catch (error) {
       const raw = error instanceof Error ? error.message : String(error);
       const key = restartErrorKey(raw);
-      setFailure(key ? t(key) : raw);
+      setFailure(key ? t(key) : kind === "outOfDate" ? t("boot.startFailed") : raw);
     } finally {
       busyRef.current = false;
       setBusy(false);
@@ -234,7 +252,7 @@ function ServiceWarning({
           {copy.body.map((line) => (
             <p key={line} className="mem-daemon-startup-body">{line}</p>
           ))}
-          {failure && <p role="alert" className="mem-daemon-startup-failure">{failure}</p>}
+          {visibleFailure && <p role="alert" className="mem-daemon-startup-failure">{visibleFailure}</p>}
           <div>
             <button
               type="button"
