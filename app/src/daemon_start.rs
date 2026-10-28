@@ -164,6 +164,36 @@ fn launchd_install_pending() -> bool {
 /// second child that had already seen the first one healthy exits 75, which
 /// leaves zero owners.
 static OWNER_DECISION: Mutex<()> = Mutex::new(());
+static UPDATE_INSTALL_LEASE: AtomicBool = AtomicBool::new(false);
+const UPDATE_INSTALL_BUSY: &str = "Wenlan is installing an update; try again after it finishes.";
+
+/// Inhibits app-owned process starts while an installer takes over. Acquisition
+/// is serialized with daemon spawns; the caller also holds the remote controller
+/// mutex so a remote spawn cannot pass its check while the lease is acquired.
+pub(crate) struct UpdateInstallLease;
+
+pub(crate) fn acquire_update_install_lease() -> Result<UpdateInstallLease, String> {
+    with_owner_decision(|| {
+        if UPDATE_INSTALL_LEASE.swap(true, Ordering::SeqCst) {
+            return Err(UPDATE_INSTALL_BUSY.into());
+        }
+        Ok(UpdateInstallLease)
+    })
+}
+
+pub(crate) fn ensure_update_spawn_allowed() -> Result<(), String> {
+    if UPDATE_INSTALL_LEASE.load(Ordering::SeqCst) {
+        Err(UPDATE_INSTALL_BUSY.into())
+    } else {
+        Ok(())
+    }
+}
+
+impl Drop for UpdateInstallLease {
+    fn drop(&mut self) {
+        with_owner_decision(|| UPDATE_INSTALL_LEASE.store(false, Ordering::SeqCst));
+    }
+}
 
 pub(crate) fn with_owner_decision<T>(operation: impl FnOnce() -> T) -> T {
     let _decision = OWNER_DECISION
@@ -573,13 +603,24 @@ fn forget_sidecar(generation: u64) {
 /// errored — and a `()` makes them indistinguishable. Callers branch on it,
 /// and the last one is readable on the diagnostics wire.
 pub async fn stop_sidecar() -> SidecarStopOutcome {
-    let outcome = stop_sidecar_inner().await;
+    stop_sidecar_with_ticket().await.0
+}
+
+// Carries the exact generation for a caller that survives a failed stop.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SidecarStopTicket {
+    generation: u64,
+    identity: SidecarIdentity,
+}
+
+pub(crate) async fn stop_sidecar_with_ticket() -> (SidecarStopOutcome, Option<SidecarStopTicket>) {
+    let (outcome, ticket) = stop_sidecar_inner().await;
     let mut last = LAST_SIDECAR_STOP
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *last = next_recorded_stop(last.as_ref(), outcome.clone());
     drop(last);
-    outcome
+    (outcome, ticket)
 }
 
 /// What [`LAST_SIDECAR_STOP`] should hold after a stop reported `next`. Pure so
@@ -613,7 +654,7 @@ fn next_recorded_stop(
     }
 }
 
-async fn stop_sidecar_inner() -> SidecarStopOutcome {
+async fn stop_sidecar_inner() -> (SidecarStopOutcome, Option<SidecarStopTicket>) {
     // Read the slot, do not empty it. A `take()` before anything is known
     // drops the identity a retry needs, makes `sidecar_job_binding()` answer
     // `None` while a daemon still holds the port, and turns the next
@@ -636,7 +677,11 @@ async fn stop_sidecar_inner() -> SidecarStopOutcome {
             )
         })
     }) else {
-        return SidecarStopOutcome::NoSidecar;
+        return (SidecarStopOutcome::NoSidecar, None);
+    };
+    let ticket = SidecarStopTicket {
+        generation,
+        identity,
     };
     let pid = identity.pid;
     let client = crate::api::WenlanClient::new();
@@ -682,7 +727,38 @@ async fn stop_sidecar_inner() -> SidecarStopOutcome {
              the real binding"
         );
     }
-    outcome
+    (outcome, Some(ticket))
+}
+
+// The failed stop may have sent an asynchronous shutdown. Do not accept its
+// still-healthy response as recovery; establish that this exact generation is
+// gone before starting or accepting any replacement.
+pub(crate) async fn wait_for_stopped_sidecar(
+    ticket: SidecarStopTicket,
+    limit: Duration,
+) -> Result<(), String> {
+    wait_for_original_stop(|| ticket.identity.presence(), limit).await?;
+    forget_sidecar(ticket.generation);
+    Ok(())
+}
+
+async fn wait_for_original_stop(
+    mut presence: impl FnMut() -> ProcessPresence,
+    limit: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if presence() == ProcessPresence::Gone {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "the original daemon did not have a confirmed exit within {limit:?}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100).min(deadline - now)).await;
+    }
 }
 
 /// Spend the child handle on `generation`'s sidecar and, when nothing outside
@@ -992,6 +1068,8 @@ pub fn spawn_daemon_sidecar(app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 fn spawn_daemon_sidecar_unlocked(app: &tauri::AppHandle) -> Result<(), String> {
+    // Every caller holds OWNER_DECISION, the same lock as lease acquisition.
+    ensure_update_spawn_allowed()?;
     use tauri_plugin_shell::ShellExt;
     let (data_dir_env, data_dir) = crate::identity_paths::sidecar_data_dir_env();
     let command = app
@@ -1819,6 +1897,31 @@ mod version_heal_tests {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn delayed_original_stop_must_finish_before_recovery() {
+        use super::{wait_for_original_stop, ProcessPresence};
+        use std::time::Duration;
+        let mut observations = 0;
+        let result = wait_for_original_stop(
+            || {
+                observations += 1;
+                if observations < 3 {
+                    ProcessPresence::Running
+                } else {
+                    ProcessPresence::Gone
+                }
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(observations, 3);
+        assert!(
+            wait_for_original_stop(|| ProcessPresence::Unknown, Duration::from_millis(20))
+                .await
+                .is_err()
+        );
+    }
     use super::*;
     use crate::lifecycle::LaunchdOwnership;
 

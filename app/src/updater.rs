@@ -18,6 +18,8 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const DAEMON_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const DAEMON_RECOVERY_POLL: Duration = Duration::from_millis(250);
 
 static UPDATER_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -366,6 +368,223 @@ async fn prompt_via_overlay(app: &AppHandle, version: &str) -> bool {
     accepted
 }
 
+/// Resolve the release again after consent, immediately before downloading.
+/// The manifest points at one immutable release, so an offer held open while a
+/// newer release is published must not keep the older asset alive.
+async fn refresh_update(
+    updater: &tauri_plugin_updater::Updater,
+) -> Result<Option<tauri_plugin_updater::Update>, String> {
+    updater.check().await.map_err(|error| error.to_string())
+}
+
+fn update_restart_block_reason(
+    outcome: &crate::daemon_start::SidecarStopOutcome,
+) -> Option<String> {
+    use crate::daemon_start::SidecarStopOutcome;
+
+    match outcome {
+        SidecarStopOutcome::NoSidecar | SidecarStopOutcome::Ended => None,
+        SidecarStopOutcome::StillRunning { reason } => Some(format!(
+            "update is ready, but the app sidecar is still running: {reason}"
+        )),
+        SidecarStopOutcome::CouldNotMeasure { reason } => Some(format!(
+            "update is ready, but the app could not verify that its sidecar stopped: {reason}"
+        )),
+    }
+}
+
+fn report_install_failure(
+    app: &AppHandle,
+    state: &SharedLifecycleState,
+    version: &str,
+    message: String,
+) {
+    log::error!("update failed: {message}");
+    let _ = app.emit(
+        "updater://progress",
+        serde_json::json!({ "error": message }),
+    );
+    set_status(
+        app,
+        state,
+        KnownStatus {
+            state: StatusState::Error,
+            version: Some(version.to_string()),
+            error: Some(message),
+        },
+    );
+    set_phase(state, LifecyclePhase::Idle);
+}
+
+fn check_recovered_daemon_version(actual: &str) -> Result<(), String> {
+    let expected = env!("CARGO_PKG_VERSION");
+    if crate::release_part(actual) == crate::release_part(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "daemon reports version {actual}; expected {expected}"
+        ))
+    }
+}
+
+fn validate_recovered_daemon_health(
+    health: &wenlan_types::responses::HealthResponse,
+) -> Result<(), String> {
+    if health.status != "ok" {
+        return Err(format!(
+            "daemon health status is {}; expected ok",
+            health.status
+        ));
+    }
+    if !health.db_initialized {
+        return Err("daemon health reports that its database is not initialized".to_string());
+    }
+    check_recovered_daemon_version(&health.version)
+}
+
+async fn restore_stopped_daemon(
+    app: &AppHandle,
+    client: &crate::api::WenlanClient,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + DAEMON_RECOVERY_TIMEOUT;
+    let mut last_start_error = None;
+    let mut last_health_error = None;
+    let mut last_version_error = None;
+
+    loop {
+        match tokio::time::timeout_at(
+            deadline,
+            crate::daemon_start::start_daemon_if_unowned(app, client),
+        )
+        .await
+        {
+            Ok(crate::daemon_start::DaemonStartResult::Failed { message }) => {
+                last_start_error = Some(message);
+            }
+            Ok(crate::daemon_start::DaemonStartResult::Started)
+            | Ok(crate::daemon_start::DaemonStartResult::AlreadyRunning)
+            | Ok(crate::daemon_start::DaemonStartResult::LaunchdManaged) => {}
+            Err(_) => break,
+        }
+
+        match tokio::time::timeout_at(deadline, client.health()).await {
+            Ok(Ok(health)) => match validate_recovered_daemon_health(&health) {
+                Ok(()) => return Ok(()),
+                Err(error) => last_version_error = Some(error),
+            },
+            Ok(Err(error)) => last_health_error = Some(error),
+            Err(_) => break,
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep(DAEMON_RECOVERY_POLL.min(deadline - now)).await;
+    }
+
+    let mut details = vec![format!(
+        "daemon recovery did not confirm version {} within {DAEMON_RECOVERY_TIMEOUT:?}",
+        env!("CARGO_PKG_VERSION")
+    )];
+    if let Some(error) = last_start_error {
+        details.push(format!("last start attempt: {error}"));
+    }
+    if let Some(error) = last_health_error {
+        details.push(format!("last health check: {error}"));
+    }
+    if let Some(error) = last_version_error {
+        details.push(error);
+    }
+    Err(details.join("; "))
+}
+
+async fn recover_after_original_exit(
+    wait_for_exit: impl std::future::Future<Output = Result<(), String>>,
+    restore: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    wait_for_exit.await?;
+    restore.await
+}
+
+async fn resume_saved_remote_access(
+    app: &AppHandle,
+    state: &SharedLifecycleState,
+) -> Option<String> {
+    let ticket = crate::remote_access::prepare_startup(app.clone()).await;
+    if let Some(ticket) = ticket {
+        // A later update may already have stopped remote access. Obtain the
+        // generation ticket first, then check the updater phase: a subsequent
+        // stop invalidates the ticket before it can start a new process.
+        loop {
+            let installing = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .phase
+                == LifecyclePhase::Installing;
+            if !installing {
+                break;
+            }
+            // A successful install ends this process. If it fails, let this
+            // recovery continue; the ticket still rejects any later stop.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        crate::remote_access::resume_startup(app.clone(), ticket).await;
+    }
+    let app_state = app.state::<Arc<tokio::sync::RwLock<crate::state::AppState>>>();
+    let remote = { app_state.read().await.remote_access.clone() };
+    let status = remote.lock().await.status.clone();
+    match status {
+        crate::remote_access::RemoteAccessStatus::Error { error } => {
+            Some(format!("saved remote access could not resume: {error}"))
+        }
+        crate::remote_access::RemoteAccessStatus::Off
+        | crate::remote_access::RemoteAccessStatus::Starting
+        | crate::remote_access::RemoteAccessStatus::Connected { .. } => None,
+    }
+}
+
+async fn report_failure_after_cleanup(
+    app: &AppHandle,
+    state: &SharedLifecycleState,
+    version: &str,
+    message: String,
+    restart_stopped_sidecar: bool,
+) {
+    let mut recovery_errors = Vec::new();
+    if restart_stopped_sidecar {
+        let client = crate::api::WenlanClient::new();
+        if let Err(error) = restore_stopped_daemon(app, &client).await {
+            recovery_errors.push(format!("daemon recovery failed: {error}"));
+        }
+    }
+    let message = if recovery_errors.is_empty() {
+        message
+    } else {
+        format!("{message} ({})", recovery_errors.join("; "))
+    };
+    // Report the installer failure before reconnecting: relay backoff may take
+    // minutes, and a timed-out cleanup may still own the controller lock.
+    let recovery_app = app.clone();
+    let recovery_state = state.clone();
+    report_then_recover(
+        || report_install_failure(app, state, version, message),
+        async move {
+            if let Some(error) = resume_saved_remote_access(&recovery_app, &recovery_state).await {
+                log::error!("[updater] remote access recovery failed: {error}");
+            }
+        },
+    );
+}
+
+fn report_then_recover(
+    report: impl FnOnce(),
+    recovery: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    report();
+    tauri::async_runtime::spawn(recovery);
+}
+
 async fn check_once_after_begin(
     app: &AppHandle,
     state: &SharedLifecycleState,
@@ -384,7 +603,7 @@ async fn check_once_after_begin(
         }
     };
 
-    let mut update = match updater.check().await {
+    let update = match updater.check().await {
         Ok(Some(update)) => update,
         Ok(None) => {
             set_status(app, state, KnownStatus::current());
@@ -401,6 +620,10 @@ async fn check_once_after_begin(
     };
 
     let version = update.version.clone();
+    // Retain only the version while the user considers the offer. The Update
+    // itself carries a release-specific URL that may age while the prompt is
+    // open; the accepted path resolves a fresh Update before installing.
+    drop(update);
     let suppressed = !should_prompt(trigger, was_recently_dismissed(app, &version));
     if !suppressed {
         // Mark the prompt pending before publishing availability so a
@@ -431,6 +654,31 @@ async fn check_once_after_begin(
         return;
     }
 
+    set_phase(state, LifecyclePhase::Checking);
+    let mut update = match refresh_update(&updater).await {
+        Ok(Some(update)) => update,
+        Ok(None) => {
+            set_status(app, state, KnownStatus::current());
+            set_phase(state, LifecyclePhase::Idle);
+            return;
+        }
+        Err(error) => {
+            log::warn!("update recheck failed: {error}");
+            set_status(app, state, KnownStatus::error(error));
+            set_phase(state, LifecyclePhase::Idle);
+            return;
+        }
+    };
+    let version = update.version.clone();
+    set_status(
+        app,
+        state,
+        KnownStatus {
+            state: StatusState::Available,
+            version: Some(version.clone()),
+            error: None,
+        },
+    );
     set_phase(state, LifecyclePhase::Installing);
     let app_chunk = app.clone();
     let on_chunk = move |chunk_len: usize, total: Option<u64>| {
@@ -450,23 +698,67 @@ async fn check_once_after_begin(
     // Update starts with timeout None even when the builder timeout is set, so
     // bind the package budget here; configure_client carries over for body reads.
     configure_download(&mut update);
-    if let Err(error) = update.download_and_install(on_chunk, on_done).await {
-        let message = error.to_string();
-        log::error!("update install failed: {message}");
-        let _ = app.emit(
-            "updater://progress",
-            serde_json::json!({ "error": message }),
-        );
-        set_status(
-            app,
-            state,
-            KnownStatus {
-                state: StatusState::Error,
-                version: Some(version),
-                error: Some(message),
-            },
-        );
-        set_phase(state, LifecyclePhase::Idle);
+    let bytes = match update.download(on_chunk, on_done).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            report_install_failure(app, state, &version, error.to_string());
+            return;
+        }
+    };
+
+    // Once acquired, actual remote and daemon spawn decisions are inhibited
+    // through installer handoff, including commands already in flight.
+    let install_lease = match tokio::time::timeout(
+        Duration::from_secs(8),
+        crate::remote_access::acquire_update_install_lease(app),
+    )
+    .await
+    {
+        Ok(Ok(lease)) => lease,
+        Ok(Err(error)) => {
+            report_install_failure(app, state, &version, error);
+            return;
+        }
+        Err(_) => {
+            report_install_failure(
+                app,
+                state,
+                &version,
+                "Remote access is still busy; try updating again.".into(),
+            );
+            return;
+        }
+    };
+
+    if let Err(error) = crate::remote_access::shutdown_for_exit(app).await {
+        drop(install_lease);
+        report_failure_after_cleanup(app, state, &version, error, false).await;
+        return;
+    }
+
+    let (outcome, stop_ticket) = crate::daemon_start::stop_sidecar_with_ticket().await;
+    if let Some(mut message) = update_restart_block_reason(&outcome) {
+        drop(install_lease);
+        if let Some(ticket) = stop_ticket {
+            let client = crate::api::WenlanClient::new();
+            if let Err(error) = recover_after_original_exit(
+                crate::daemon_start::wait_for_stopped_sidecar(ticket, DAEMON_RECOVERY_TIMEOUT),
+                restore_stopped_daemon(app, &client),
+            )
+            .await
+            {
+                message = format!("{message} (daemon recovery failed: {error})");
+            }
+        }
+        report_failure_after_cleanup(app, state, &version, message, false).await;
+        return;
+    }
+
+    if let Err(error) = update.install(bytes) {
+        drop(install_lease);
+        let sidecar_was_stopped = matches!(outcome, crate::daemon_start::SidecarStopOutcome::Ended);
+        report_failure_after_cleanup(app, state, &version, error.to_string(), sidecar_was_stopped)
+            .await;
         return;
     }
 
@@ -608,6 +900,61 @@ pub async fn check_and_prompt(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recovery_cannot_accept_health_until_the_original_stop_finishes() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let restored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mark = restored.clone();
+        let recovery = tokio::spawn(async move {
+            recover_after_original_exit(
+                async { release_rx.await.map_err(|e| e.to_string()) },
+                async {
+                    mark.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!restored.load(std::sync::atomic::Ordering::SeqCst));
+        release_tx.send(()).unwrap();
+        recovery.await.unwrap().unwrap();
+        assert!(restored.load(std::sync::atomic::Ordering::SeqCst));
+        let called = std::sync::atomic::AtomicBool::new(false);
+        assert!(
+            recover_after_original_exit(async { Err("unknown original".into()) }, async {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },)
+            .await
+            .is_err()
+        );
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn installer_failure_is_reported_before_slow_remote_recovery() {
+        let reported = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = reported.clone();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        report_then_recover(
+            || flag.store(true, std::sync::atomic::Ordering::SeqCst),
+            async move {
+                let _ = release_rx.await;
+                let _ = done_tx.send(());
+            },
+        );
+        assert!(reported.load(std::sync::atomic::Ordering::SeqCst));
+        let mut done_rx = done_rx;
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
+        done_rx.await.unwrap();
+    }
     use crate::test_env::EnvGuard;
 
     #[test]
@@ -617,6 +964,79 @@ mod tests {
         assert!(!LifecyclePhase::Checking.accepts_manual_check());
         assert!(!LifecyclePhase::Prompting.accepts_manual_check());
         assert!(!LifecyclePhase::Installing.accepts_manual_check());
+    }
+
+    #[test]
+    fn update_restart_requires_the_sidecar_to_be_gone_or_unowned() {
+        use crate::daemon_start::SidecarStopOutcome;
+
+        assert_eq!(
+            update_restart_block_reason(&SidecarStopOutcome::NoSidecar),
+            None
+        );
+        assert_eq!(
+            update_restart_block_reason(&SidecarStopOutcome::Ended),
+            None
+        );
+        assert!(
+            update_restart_block_reason(&SidecarStopOutcome::StillRunning {
+                reason: "still listening".to_string(),
+            })
+            .unwrap()
+            .contains("still listening")
+        );
+        assert!(
+            update_restart_block_reason(&SidecarStopOutcome::CouldNotMeasure {
+                reason: "process table unavailable".to_string(),
+            })
+            .unwrap()
+            .contains("process table unavailable")
+        );
+
+        // The caller returns through report_install_failure, which restores
+        // Idle so an explicit retry can be accepted after a blocked restart.
+        assert!(LifecyclePhase::Idle.accepts_manual_check());
+    }
+
+    #[test]
+    fn daemon_recovery_requires_the_running_release_version() {
+        assert!(check_recovered_daemon_version(env!("CARGO_PKG_VERSION")).is_ok());
+        assert!(
+            check_recovered_daemon_version(&format!("{}+fixture", env!("CARGO_PKG_VERSION")))
+                .is_ok()
+        );
+        let error = check_recovered_daemon_version("0.0.0").unwrap_err();
+        assert!(error.contains("daemon reports version 0.0.0"));
+        assert!(error.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn daemon_recovery_requires_a_ready_health_response() {
+        let version = env!("CARGO_PKG_VERSION").to_string();
+        let ready = wenlan_types::responses::HealthResponse {
+            status: "ok".into(),
+            db_initialized: true,
+            version: version.clone(),
+        };
+        assert!(validate_recovered_daemon_health(&ready).is_ok());
+
+        let uninitialized = wenlan_types::responses::HealthResponse {
+            status: "ok".into(),
+            db_initialized: false,
+            version: version.clone(),
+        };
+        assert!(validate_recovered_daemon_health(&uninitialized)
+            .unwrap_err()
+            .contains("database is not initialized"));
+
+        let unhealthy = wenlan_types::responses::HealthResponse {
+            status: "starting".into(),
+            db_initialized: true,
+            version,
+        };
+        assert!(validate_recovered_daemon_health(&unhealthy)
+            .unwrap_err()
+            .contains("expected ok"));
     }
 
     #[test]

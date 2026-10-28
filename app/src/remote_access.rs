@@ -269,6 +269,7 @@ fn spawn_and_store_child<T, P>(
 }
 
 fn validate_mcp_spawn(ra: &RemoteAccessState, generation: u64) -> Result<(), String> {
+    crate::daemon_start::ensure_update_spawn_allowed()?;
     if !generation_is_current(ra.generation, generation) {
         return Err("Remote access start cancelled.".into());
     }
@@ -288,6 +289,7 @@ fn validate_mcp_spawn(ra: &RemoteAccessState, generation: u64) -> Result<(), Str
 }
 
 fn validate_write_spawn(ra: &RemoteAccessState, generation: u64) -> Result<(), String> {
+    crate::daemon_start::ensure_update_spawn_allowed()?;
     if !generation_is_current(ra.generation, generation) {
         return Err("Remote access start cancelled.".into());
     }
@@ -358,7 +360,11 @@ pub(crate) async fn prepare_reconnect(
     client: crate::api::WenlanClient,
 ) -> Result<StartupResume, String> {
     let remote = remote_access_mutex(app_handle).await;
-    let generation = remote.lock().await.generation;
+    let generation = {
+        let ra = remote.lock().await;
+        crate::daemon_start::ensure_update_spawn_allowed()?;
+        ra.generation
+    };
     let profile = validate_reconnect_profile(
         relay_runtime::storage(|store| store.load()).await?,
         &expected_revision,
@@ -533,22 +539,50 @@ async fn publish_disconnect_result(
 const SHUTDOWN_UNCONFIRMED: &str = "Local remote-access processes have not been confirmed stopped. New connections are blocked; retry Stop access.";
 const EXIT_CLEANUP_LIMIT: Duration = Duration::from_secs(8);
 
+/// Atomically close both spawn gates with respect to the remote controller and
+/// daemon owner locks. Existing starts finish before the lease is acquired;
+/// subsequent starts observe the lease before their synchronous spawn.
+pub(crate) async fn acquire_update_install_lease<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+) -> Result<crate::daemon_start::UpdateInstallLease, String> {
+    let remote = remote_access_mutex(app_handle).await;
+    let _ra = remote.lock().await;
+    crate::daemon_start::acquire_update_install_lease()
+}
+
 /// Stop only the transport and local processes owned by this app before it
 /// exits. Unlike [`toggle_off`], this deliberately does not change the saved
 /// profile or revoke its device, so a later launch may reconnect.
 pub(crate) async fn shutdown_for_exit<R: tauri::Runtime>(
     app_handle: &tauri::AppHandle<R>,
 ) -> Result<(), String> {
-    timeout(EXIT_CLEANUP_LIMIT, async {
-        transition_off(app_handle, None)
-            .await
-            .ok_or_else(|| "Remote access exit cleanup became stale".to_string())?;
-        ensure_shutdown_confirmed(app_handle).await
-    })
+    let app = app_handle.clone();
+    bounded_exit_cleanup(
+        async move {
+            transition_off(&app, None)
+                .await
+                .ok_or_else(|| "Remote access exit cleanup became stale".to_string())?;
+            ensure_shutdown_confirmed(&app).await
+        },
+        EXIT_CLEANUP_LIMIT,
+    )
     .await
-    .map_err(|_| {
-        format!("Remote access exit cleanup did not finish within {EXIT_CLEANUP_LIMIT:?}")
-    })?
+}
+
+// Timing out must not cancel the controller while its blocking scan is still
+// running. The detached task keeps the controller lock and pending ledger
+// until cleanup actually finishes, so a new generation cannot reuse its ports.
+async fn bounded_exit_cleanup(
+    cleanup: impl std::future::Future<Output = Result<(), String>> + Send + 'static,
+    limit: Duration,
+) -> Result<(), String> {
+    match timeout(limit, tokio::spawn(cleanup)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(format!("Remote access exit cleanup task failed: {error}")),
+        Err(_) => Err(format!(
+            "Remote access exit cleanup did not finish within {limit:?}"
+        )),
+    }
 }
 
 pub(crate) async fn ensure_shutdown_confirmed<R: tauri::Runtime>(
@@ -1182,6 +1216,10 @@ async fn toggle_on_inner(
         {
             return;
         }
+        if let Err(error) = crate::daemon_start::ensure_update_spawn_allowed() {
+            let _ = app_handle.emit("remote-access-status", RemoteAccessStatus::Error { error });
+            return;
+        }
         let shutdown_pending = !ra.pending_stops.is_empty() || ra.orphan_cleanup_failed;
         if shutdown_pending {
             let status = RemoteAccessStatus::Error {
@@ -1813,13 +1851,30 @@ async fn transition_off<R: tauri::Runtime>(
         |status| {
             let _ = app_handle.emit("remote-access-status", status);
         },
-        async {
+        retry_orphan_cleanup(|| async {
             tokio::task::spawn_blocking(cleanup_remote_orphans)
                 .await
                 .map_err(|_| SHUTDOWN_UNCONFIRMED.to_string())?
-        },
+        }),
     )
     .await
+}
+
+// A listener table can still contain a process that is exiting. Remeasure the
+// whole scan, without treating an unknown identity as permission to signal it.
+async fn retry_orphan_cleanup<F, Fut>(mut cleanup: F) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    for attempt in 0..3 {
+        match cleanup().await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt == 2 => return Err(error),
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    unreachable!()
 }
 
 async fn request_stops_into_state(
@@ -1879,9 +1934,18 @@ async fn stop_with_cleanup(
     // Retain the dedicated controller mutex until old-process cleanup finishes,
     // or a new start can reuse a port and be killed by the preceding stop.
     // No AppState RwLock guard is held; blocking process work runs in its pool.
-    ra.orphan_cleanup_failed = cleanup.await.is_err();
+    // Confirm owned children first, then scan for orphans. This avoids latching
+    // a transient inability to inspect a child while it is still exiting.
     ra.pending_stops =
         crate::remote_relay::shutdown::confirm_exits(std::mem::take(&mut ra.pending_stops)).await;
+    ra.orphan_cleanup_failed = cleanup.await.is_err();
+    // The scan may have stopped an owned child that the first measurement
+    // could not confirm. Recheck the same retained records before deciding.
+    if !ra.pending_stops.is_empty() {
+        ra.pending_stops =
+            crate::remote_relay::shutdown::confirm_exits(std::mem::take(&mut ra.pending_stops))
+                .await;
+    }
     if ra.pending_stops.is_empty() && !ra.orphan_cleanup_failed {
         ra.port = None;
         ra.write_port = None;
@@ -1912,6 +1976,159 @@ pub async fn toggle_off(app_handle: &tauri::AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Run the real process-wide lease in a child test process so it cannot
+    // block unrelated app tests running concurrently in the parent harness.
+    #[test]
+    #[ignore = "isolated helper for the installation lease test"]
+    fn install_lease_helper() {
+        assert_eq!(
+            std::env::var("WENLAN_INSTALL_LEASE_HELPER").as_deref(),
+            Ok("1")
+        );
+        let lease = crate::daemon_start::acquire_update_install_lease().unwrap();
+        let state = RemoteAccessState {
+            status: RemoteAccessStatus::Starting,
+            generation: 7,
+            ..Default::default()
+        };
+        let mut slot: Option<()> = None;
+        let mut port = None;
+        let blocked: Result<(), String> = spawn_and_store_child(
+            validate_mcp_spawn(&state, 7),
+            &mut slot,
+            &mut port,
+            23760,
+            || panic!("remote process must not spawn during installation"),
+            |_| Ok(()),
+        );
+        assert!(blocked.is_err());
+        assert!(validate_write_spawn(&state, 7).is_err());
+        assert!(crate::daemon_start::ensure_update_spawn_allowed().is_err());
+        assert!(crate::daemon_start::acquire_update_install_lease().is_err());
+        drop(lease);
+        assert!(crate::daemon_start::ensure_update_spawn_allowed().is_ok());
+        assert!(validate_mcp_spawn(&state, 7).is_ok());
+    }
+
+    #[test]
+    fn install_lease_blocks_remote_and_daemon_spawn_gates_until_release() {
+        let module = module_path!().split_once("::").unwrap().1;
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("{module}::install_lease_helper"),
+                "--ignored",
+            ])
+            .env("WENLAN_INSTALL_LEASE_HELPER", "1")
+            .output()
+            .expect("start isolated helper");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "installation lease helper failed or did not run: {} {stdout}",
+            output.status
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_timeout_keeps_cleanup_owned_until_scan_finishes() {
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(RemoteAccessState::default()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let owned = state.clone();
+        let timed = tokio::spawn(async move {
+            bounded_exit_cleanup(
+                async move {
+                    stop_with_cleanup(&owned, Some(0), |_| {}, async {
+                        entered_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                    Ok(())
+                },
+                Duration::from_millis(20),
+            )
+            .await
+        });
+        entered_rx.await.unwrap();
+        assert!(timed.await.unwrap().is_err());
+        assert!(state.try_lock().is_err());
+        let restarting = state.clone();
+        let start = tokio::spawn(async move {
+            let generation = restarting.lock().await.generation;
+            generation
+        });
+        tokio::task::yield_now().await;
+        assert!(!start.is_finished());
+        release_tx.send(()).unwrap();
+        assert_eq!(start.await.unwrap(), 1);
+        assert!(matches!(state.lock().await.status, RemoteAccessStatus::Off));
+    }
+
+    #[tokio::test]
+    async fn exit_timeout_during_confirmation_keeps_pending_ledger() {
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(RemoteAccessState {
+            pending_stops: vec![crate::remote_relay::shutdown::PendingProcess::unmeasured(
+                std::process::id(),
+            )],
+            ..Default::default()
+        }));
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let owned = state.clone();
+        let timed = tokio::spawn(async move {
+            bounded_exit_cleanup(
+                async move {
+                    entered_tx.send(()).unwrap();
+                    stop_with_cleanup(&owned, Some(0), |_| {}, async { Ok(()) })
+                        .await
+                        .unwrap();
+                    finished_tx.send(()).unwrap();
+                    Ok(())
+                },
+                Duration::from_millis(20),
+            )
+            .await
+        });
+        entered_rx.await.unwrap();
+        assert!(timed.await.unwrap().is_err());
+        assert!(state.try_lock().is_err());
+        tokio::time::timeout(Duration::from_secs(8), finished_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let current = state.lock().await;
+        assert_eq!(current.pending_stops.len(), 1);
+        assert!(matches!(current.status, RemoteAccessStatus::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn orphan_scan_retries_only_until_a_fresh_success() {
+        let mut attempts = 0;
+        let result = retry_orphan_cleanup(|| {
+            attempts += 1;
+            let result = if attempts == 1 {
+                Err("transient".to_string())
+            } else {
+                Ok(())
+            };
+            async move { result }
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(attempts, 2);
+        let mut attempts = 0;
+        let result = retry_orphan_cleanup(|| {
+            attempts += 1;
+            async { Err("unmeasurable".to_string()) }
+        })
+        .await;
+        assert_eq!(attempts, 3);
+        assert_eq!(result.unwrap_err(), "unmeasurable");
+    }
 
     fn reconnect_profile(enabled: bool, device: bool) -> Profile {
         serde_json::from_value(serde_json::json!({
